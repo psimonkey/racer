@@ -20,7 +20,7 @@ use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::rmt::{PulseCode, TxChannelConfig, TxChannelCreator};
 use smart_leds::RGB8;
 
-use racer::{Accel, hsv_to_rgb};
+use racer::{Accel, Effect, update_leds, NUM_LEDS};
 
 const DISPLAY_WIDTH: usize = 72;
 const DISPLAY_HEIGHT: usize = 40;
@@ -220,9 +220,23 @@ fn main() -> ! {
 
     let mut pulses = [PulseCode::default(); 20 * 24 + 1];
 
+    let effects = Effect::all();
+    let mut effect_index = 0;
+    let mut effect_time = 0usize;
+    const EFFECT_DURATION: usize = 250; // 250 * 80ms = 20 seconds
+    let mut animations_enabled = false;
+
     loop {
+        // Update OLED display and check accelerometer
         let accel_data = Bmi160::read_accel(&mut i2c, &mut delay).unwrap();
         let orientation = accel_data.dominant_axis();
+
+        // Check for positive Z acceleration to enable animations
+        if !animations_enabled && accel_data.z > 500 {  // Threshold for positive Z acceleration
+            animations_enabled = true;
+            effect_time = 0;  // Reset effect timing
+            effect_index = 0; // Start with first effect
+        }
 
         let width = DISPLAY_WIDTH as i32;
         let height = DISPLAY_HEIGHT as i32;
@@ -232,26 +246,50 @@ fn main() -> ! {
         let y = (height - text_height) / 2;
 
         display_buffer.clear();
-        let message = match orientation {
-            'X' => "X",
-            'Y' => "Y",
-            'Z' => "Z",
-            _ => "?",
+        let message = if animations_enabled {
+            match orientation {
+                'X' => "X*",
+                'Y' => "Y*",
+                'Z' => "Z*",
+                _ => "?*",
+            }
+        } else {
+            match orientation {
+                'X' => "X",
+                'Y' => "Y",
+                'Z' => "Z",
+                _ => "?",
+            }
         };
         Text::new(message, Point::new(x, y), text_style)
             .draw(&mut display_buffer)
             .unwrap();
         flush_display(&mut i2c, &display_buffer);
 
-        let mut colors = [RGB8::new(0, 0, 0); 20];
-        for (index, led) in colors.iter_mut().enumerate() {
-            let hue = (index as u16) * 18; // 360 / 20
-            *led = hsv_to_rgb(hue, 128);
+        // Handle LED animations
+        if animations_enabled {
+            let current_effect = effects[effect_index];
+            let mut colors = [RGB8::new(0, 0, 0); NUM_LEDS];
+            update_leds(&mut colors, current_effect, effect_time);
+
+            encode_ws2812(&colors, &mut pulses);
+            let transaction = channel.transmit(&pulses).unwrap();
+            channel = transaction.wait().unwrap();
+
+            // Cycle through effects
+            effect_time = effect_time.wrapping_add(1);
+            if effect_time >= EFFECT_DURATION {
+                effect_time = 0;
+                effect_index = (effect_index + 1) % effects.len();
+            }
+        } else {
+            // LEDs off
+            let colors = [RGB8::new(0, 0, 0); NUM_LEDS];
+            encode_ws2812(&colors, &mut pulses);
+            let transaction = channel.transmit(&pulses).unwrap();
+            channel = transaction.wait().unwrap();
         }
 
-        encode_ws2812(&colors, &mut pulses);
-        let transaction = channel.transmit(&pulses).unwrap();
-        channel = transaction.wait().unwrap();
         delay.delay_millis(80);
     }
 }
