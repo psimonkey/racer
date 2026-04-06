@@ -1,0 +1,15 @@
+[build]
+target = "riscv32imc-unknown-none-elf"
+
+[target.'cfg(target_arch = "riscv32")']
+runner = "probe-rs run --chip esp32c3"
+rustflags = [
+  "-C", "link-arg=-Tlinkall.x",
+  "-C", "force-frame-pointers",
+]
+
+[env]
+ESP_LOG = "info"
+
+[unstable]
+build-std = ["core", "alloc"]

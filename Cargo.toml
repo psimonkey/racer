@@ -1,0 +1,25 @@
+[package]
+name = "racer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "racer"
+test = false
+
+[dependencies]
+embedded-graphics = "0.8.2"
+embedded-hal = "1.0.0"
+ssd1306 = "0.10.0"
+smart-leds = "0.4.0"
+esp-backtrace = { path = "../../esp-hal/esp-backtrace", features = ["esp32c3", "panic-handler", "println"] }
+esp-bootloader-esp-idf = { path = "../../esp-hal/esp-bootloader-esp-idf", features = ["esp32c3"] }
+esp-hal = { path = "../../esp-hal/esp-hal", features = ["esp32c3", "log-04", "unstable"] }
+esp-println = { path = "../../esp-hal/esp-println", default-features = false, features = ["uart"] }
+
+[profile.release]
+debug = true
+debug-assertions = true
+lto = "fat"
+codegen-units = 1
