@@ -3,6 +3,7 @@
 //! Uses a 0.42-inch SSD1306 I2C OLED display wired to GPIO5 (SDA) and GPIO6 (SCL).
 //! A BMI160 accelerometer/gyroscope is on the same I2C bus, GPIO5 (SDA) and GPIO6 (SCL).
 //! A string of 20 WS2812B LEDs is driven from GPIO7.
+//! Connects to WiFi network "psimonkey" with password "ilikemonkeys" and serves a web page.
 
 #![no_std]
 #![no_main]
@@ -22,6 +23,32 @@ use smart_leds::RGB8;
 
 use racer::{Accel, Effect, update_leds, NUM_LEDS};
 
+use embassy_net::{
+    IpListenEndpoint,
+    Runner,
+    Stack,
+    StackResources,
+    tcp::TcpSocket,
+};
+use embassy_executor::Spawner;
+use embassy_time::{Duration, Timer};
+use esp_alloc as _;
+use esp_hal::{
+    clock::CpuClock,
+    interrupt::software::SoftwareInterruptControl,
+    ram,
+    rng::Rng,
+    timer::timg::TimerGroup,
+};
+use esp_println::{print, println};
+use esp_radio::wifi::{
+    Config,
+    ControllerConfig,
+    Interface,
+    sta::StationConfig,
+};
+use static_cell::StaticCell;
+
 const DISPLAY_WIDTH: usize = 72;
 const DISPLAY_HEIGHT: usize = 40;
 const DISPLAY_PAGES: usize = DISPLAY_HEIGHT / 8;
@@ -35,6 +62,12 @@ const BMI160_ACCEL_DATA: u8 = 0x12;
 const BMI160_CMD_ACCEL_NORMAL: u8 = 0x11;
 const BMI160_ACC_RANGE: u8 = 0x41;
 const BMI160_ACC_RANGE_2G: u8 = 0x03;
+
+const WIFI_NETWORK: &str = "REDACTED";
+const WIFI_PASSWORD: &str = "REDACTED";
+
+static mut CURRENT_EFFECT: Effect = Effect::RainbowSections;
+static mut CURRENT_ORIENTATION: char = 'X';
 
 struct Bmi160;
 
@@ -180,31 +213,204 @@ fn flush_display(i2c: &mut I2c<'_, esp_hal::Blocking>, buffer: &DisplayBuffer) {
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
+#[embassy_executor::task]
+async fn net_task(mut runner: Runner<'static, Interface<'static>>) {
+    runner.run().await
+}
+
+#[embassy_executor::task]
+async fn web_server(stack: Stack<'static>) {
+    let mut rx_buffer = [0; 1536];
+    let mut tx_buffer = [0; 1536];
+
+    loop {
+        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
+
+        println!("Web server: Waiting for connection...");
+        let r = socket
+            .accept(IpListenEndpoint {
+                addr: None,
+                port: 80,
+            })
+            .await;
+        println!("Web server: Connection attempt result: {:?}", r.is_ok());
+
+        if let Err(e) = r {
+            println!("Web server: Connection error: {:?}", e);
+            continue;
+        }
+
+        println!("Web server: Client connected, processing request...");
+
+        let mut buffer = [0u8; 1024];
+        let mut pos = 0;
+        loop {
+            match socket.read(&mut buffer).await {
+                Ok(0) => {
+                    println!("read EOF");
+                    break;
+                }
+                Ok(len) => {
+                    let to_print =
+                        unsafe { core::str::from_utf8_unchecked(&buffer[..(pos + len)]) };
+
+                    if to_print.contains("\r\n\r\n") {
+                        print!("{}", to_print);
+                        println!();
+                        break;
+                    }
+
+                    pos += len;
+                }
+                Err(e) => {
+                    println!("read error: {:?}", e);
+                    break;
+                }
+            };
+        }
+
+        // For now, just send a simple response
+        // TODO: Get current effect name and orientation
+        let (effect_name, orientation) = unsafe {
+            (CURRENT_EFFECT, CURRENT_ORIENTATION)
+        };
+
+        // Simple HTML response
+        let response = match (effect_name, orientation) {
+            (Effect::RainbowSections, 'X') => "HTTP/1.0 200 OK\r\n\r\n<html><body><h1>Racer Status</h1><p>Current Effect: Rainbow Sections</p><p>Orientation: X</p></body></html>\r\n",
+            (Effect::RainbowSections, 'Y') => "HTTP/1.0 200 OK\r\n\r\n<html><body><h1>Racer Status</h1><p>Current Effect: Rainbow Sections</p><p>Orientation: Y</p></body></html>\r\n",
+            (Effect::RainbowSections, 'Z') => "HTTP/1.0 200 OK\r\n\r\n<html><body><h1>Racer Status</h1><p>Current Effect: Rainbow Sections</p><p>Orientation: Z</p></body></html>\r\n",
+            (Effect::WaveChase, 'X') => "HTTP/1.0 200 OK\r\n\r\n<html><body><h1>Racer Status</h1><p>Current Effect: Wave Chase</p><p>Orientation: X</p></body></html>\r\n",
+            (Effect::WaveChase, 'Y') => "HTTP/1.0 200 OK\r\n\r\n<html><body><h1>Racer Status</h1><p>Current Effect: Wave Chase</p><p>Orientation: Y</p></body></html>\r\n",
+            (Effect::WaveChase, 'Z') => "HTTP/1.0 200 OK\r\n\r\n<html><body><h1>Racer Status</h1><p>Current Effect: Wave Chase</p><p>Orientation: Z</p></body></html>\r\n",
+            (Effect::AlternatingGlow, 'X') => "HTTP/1.0 200 OK\r\n\r\n<html><body><h1>Racer Status</h1><p>Current Effect: Alternating Glow</p><p>Orientation: X</p></body></html>\r\n",
+            (Effect::AlternatingGlow, 'Y') => "HTTP/1.0 200 OK\r\n\r\n<html><body><h1>Racer Status</h1><p>Current Effect: Alternating Glow</p><p>Orientation: Y</p></body></html>\r\n",
+            (Effect::AlternatingGlow, 'Z') => "HTTP/1.0 200 OK\r\n\r\n<html><body><h1>Racer Status</h1><p>Current Effect: Alternating Glow</p><p>Orientation: Z</p></body></html>\r\n",
+            _ => "HTTP/1.0 200 OK\r\n\r\n<html><body><h1>Racer Status</h1><p>Current Effect: Unknown</p><p>Orientation: ?</p></body></html>\r\n",
+        };
+
+        let r = socket.write(response.as_bytes()).await;
+        if let Err(e) = r {
+            println!("write error: {:?}", e);
+        }
+
+        let r = socket.flush().await;
+        if let Err(e) = r {
+            println!("flush error: {:?}", e);
+        }
+        Timer::after(Duration::from_millis(1000)).await;
+
+        socket.close();
+        Timer::after(Duration::from_millis(1000)).await;
+
+        socket.abort();
+    }
+}
+
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 
-#[esp_hal::main]
-fn main() -> ! {
-    let peripherals = esp_hal::init(esp_hal::Config::default());
+#[esp_rtos::main]
+async fn main(spawner: Spawner) -> ! {
+    esp_println::logger::init_logger_from_env();
+    println!("Racer ESP32-C3 starting up...");
+
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    println!("Initializing ESP-HAL...");
+    let peripherals = esp_hal::init(config);
+    println!("ESP-HAL initialized successfully");
+
+    println!("Setting up heap allocators...");
+    esp_alloc::heap_allocator!(#[ram(reclaimed)] size: 64 * 1024);
+    esp_alloc::heap_allocator!(size: 36 * 1024);
+    println!("Heap allocators configured");
+
+    println!("Starting RTOS...");
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+    println!("RTOS started");
+
+    println!("Configuring WiFi for network: {}", WIFI_NETWORK);
+    let station_config = Config::Station(
+        StationConfig::default()
+            .with_ssid(WIFI_NETWORK)
+            .with_password(WIFI_PASSWORD.into()),
+    );
+
+    println!("Starting WiFi controller...");
+    let (_controller, interfaces) = esp_radio::wifi::new(
+        peripherals.WIFI,
+        ControllerConfig::default().with_initial_config(station_config),
+    )
+    .unwrap();
+    println!("WiFi controller started successfully");
+
+    let wifi_interface = interfaces.station;
+
+    println!("Setting up network stack with DHCP...");
+    let config = embassy_net::Config::dhcpv4(Default::default());
+
+    let rng = Rng::new();
+    let seed = (rng.random() as u64) << 32 | rng.random() as u64;
+
+    // Init network stack
+    let (stack, runner) = embassy_net::new(
+        wifi_interface,
+        config,
+        {
+            static STACK_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+            STACK_RESOURCES.init(StackResources::<3>::new())
+        },
+        seed,
+    );
+    println!("Network stack initialized");
+
+    // Spawn network task
+    println!("Spawning network task...");
+    spawner.spawn(net_task(runner).unwrap());
+    println!("Network task spawned");
+
+    // Wait for DHCP
+    println!("Waiting for DHCP configuration...");
+    stack.wait_config_up().await;
+    let config = stack.config_v4().unwrap();
+    println!("DHCP successful! IP address: {}", config.address);
+
+    // Spawn web server task
+    println!("Starting web server on port 80...");
+    spawner.spawn(web_server(stack).unwrap());
+    println!("Web server started");
+
+    // Initialize hardware
+    println!("Initializing hardware peripherals...");
     let mut delay = Delay::new();
 
+    println!("Setting up I2C for display and accelerometer...");
     let mut i2c = I2c::new(peripherals.I2C0, I2cConfig::default())
         .unwrap()
         .with_sda(peripherals.GPIO5)
         .with_scl(peripherals.GPIO6);
+    println!("I2C configured");
 
+    println!("Initializing OLED display...");
     initialize_display(&mut i2c, &mut delay);
     let mut display_buffer = DisplayBuffer::default();
+    println!("OLED display initialized");
 
+    println!("Initializing BMI160 accelerometer...");
     Bmi160::init(&mut i2c, &mut delay).unwrap();
+    println!("BMI160 accelerometer initialized");
 
     let text_style = MonoTextStyleBuilder::new()
         .font(&FONT_6X10)
         .text_color(BinaryColor::On)
         .build();
 
+    println!("Setting up RMT for LED control...");
     let rmt = esp_hal::rmt::Rmt::new(peripherals.RMT, esp_hal::time::Rate::from_mhz(80)).unwrap();
     let tx_config = TxChannelConfig::default()
         .with_clk_divider(1)
@@ -217,6 +423,7 @@ fn main() -> ! {
         .configure_tx(&tx_config)
         .unwrap()
         .with_pin(peripherals.GPIO7);
+    println!("RMT and LED control configured");
 
     let mut pulses = [PulseCode::default(); 20 * 24 + 1];
 
@@ -226,16 +433,25 @@ fn main() -> ! {
     const EFFECT_DURATION: usize = 250; // 250 * 80ms = 20 seconds
     let mut animations_enabled = false;
 
+    println!("All initialization complete! Starting main loop...");
+    println!("Device ready. Point your browser to http://{}:80/", config.address);
+
     loop {
         // Update OLED display and check accelerometer
         let accel_data = Bmi160::read_accel(&mut i2c, &mut delay).unwrap();
         let orientation = accel_data.dominant_axis();
+
+        // Update shared state
+        unsafe {
+            CURRENT_ORIENTATION = orientation;
+        }
 
         // Check for positive Z acceleration to enable animations
         if !animations_enabled && accel_data.z > 500 {  // Threshold for positive Z acceleration
             animations_enabled = true;
             effect_time = 0;  // Reset effect timing
             effect_index = 0; // Start with first effect
+            println!("Animations enabled! Starting LED effects...");
         }
 
         let width = DISPLAY_WIDTH as i32;
@@ -269,6 +485,9 @@ fn main() -> ! {
         // Handle LED animations
         if animations_enabled {
             let current_effect = effects[effect_index];
+            unsafe {
+                CURRENT_EFFECT = current_effect;
+            }
             let mut colors = [RGB8::new(0, 0, 0); NUM_LEDS];
             update_leds(&mut colors, current_effect, effect_time);
 
@@ -290,6 +509,6 @@ fn main() -> ! {
             channel = transaction.wait().unwrap();
         }
 
-        delay.delay_millis(80);
+        Timer::after(Duration::from_millis(80)).await;
     }
 }

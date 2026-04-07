@@ -18,11 +18,23 @@ pub const RAINBOW: [RGB8; 7] = [
     RGB8 { r: 238, g: 130, b: 238 },   // Violet
 ];
 
+use core::fmt;
+
 #[derive(Clone, Copy)]
 pub enum Effect {
     RainbowSections,
     WaveChase,
     AlternatingGlow,
+}
+
+impl fmt::Display for Effect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Effect::RainbowSections => write!(f, "Rainbow Sections"),
+            Effect::WaveChase => write!(f, "Wave Chase"),
+            Effect::AlternatingGlow => write!(f, "Alternating Glow"),
+        }
+    }
 }
 
 impl Effect {

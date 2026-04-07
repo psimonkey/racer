@@ -6,4 +6,10 @@
 - I2C wiring for the display and BMI160 module: GPIO5 = SDA, GPIO6 = SCL
 - Set of 20 WS2812B addressable LEDs on GPIO7
 - Power wiring: `3V3` = VCC, `GND` = GND
-- Function: Show "X", "Y", or "Z" on the display, depending on data from the accelerometer.  Also cycle rainbow colours at half brightness on the LED strip.
+- WiFi: Connects to "psimonkey" network with password "ilikemonkeys", DHCP for IP
+- Web server: Runs on port 80, displays current LED effect and accelerometer orientation
+- Flashing: Use `cargo run --release` (uses probe-rs)  
+- Serial monitoring: Run `espflash monitor` in a separate terminal after flashing
+- Debug output: Serial console prints debug statements throughout boot and WiFi connection process
+- Status: Project successfully builds with --release profile. Device boots, connects to WiFi, and serves web interface.
+- Function: Show "X", "Y", or "Z" on the display, depending on data from the accelerometer.  Also cycle rainbow colours at half brightness on the LED strip. Web interface shows status.
