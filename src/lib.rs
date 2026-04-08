@@ -5,7 +5,7 @@
 use smart_leds::RGB8;
 
 /// Number of LEDs in the strip
-pub const NUM_LEDS: usize = 20;
+pub const NUM_LEDS: usize = 32;
 
 /// Rainbow colors
 pub const RAINBOW: [RGB8; 7] = [
@@ -22,6 +22,9 @@ use core::fmt;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Effect {
+    Off,
+    BlueRedChase,
+    RainbowTravel,
     RainbowSections,
     WaveChase,
     AlternatingGlow,
@@ -30,6 +33,9 @@ pub enum Effect {
 impl fmt::Display for Effect {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Effect::Off => write!(f, "Off"),
+            Effect::BlueRedChase => write!(f, "Blue Red Chase"),
+            Effect::RainbowTravel => write!(f, "Rainbow Travel"),
             Effect::RainbowSections => write!(f, "Rainbow Sections"),
             Effect::WaveChase => write!(f, "Wave Chase"),
             Effect::AlternatingGlow => write!(f, "Alternating Glow"),
@@ -38,12 +44,15 @@ impl fmt::Display for Effect {
 }
 
 impl Effect {
-    pub const fn all() -> [Effect; 3] {
-        [Effect::RainbowSections, Effect::WaveChase, Effect::AlternatingGlow]
+    pub const fn all() -> [Effect; 6] {
+        [Effect::Off, Effect::BlueRedChase, Effect::RainbowTravel, Effect::RainbowSections, Effect::WaveChase, Effect::AlternatingGlow]
     }
     
     pub fn as_str(&self) -> &'static str {
         match self {
+            Effect::Off => "Off",
+            Effect::BlueRedChase => "Blue Red Chase",
+            Effect::RainbowTravel => "Rainbow Travel",
             Effect::RainbowSections => "Rainbow Sections",
             Effect::WaveChase => "Wave Chase",
             Effect::AlternatingGlow => "Alternating Glow",
@@ -54,6 +63,30 @@ impl Effect {
 pub fn update_leds(data: &mut [RGB8; NUM_LEDS], effect: Effect, time: usize) {
     for i in 0..NUM_LEDS {
         data[i] = match effect {
+            Effect::Off => RGB8::default(),
+            Effect::BlueRedChase => {
+                // Chasing blue and red LEDs
+                let position = (time / 3) % (NUM_LEDS * 2);
+                let led_pos = if position < NUM_LEDS {
+                    position
+                } else {
+                    NUM_LEDS * 2 - position - 1
+                };
+                if i == led_pos {
+                    if position < NUM_LEDS {
+                        RGB8 { r: 0, g: 0, b: 255 } // Blue
+                    } else {
+                        RGB8 { r: 255, g: 0, b: 0 } // Red
+                    }
+                } else {
+                    RGB8::default()
+                }
+            }
+            Effect::RainbowTravel => {
+                // Rainbow colors traveling along the strip
+                let hue = ((i as usize * 360 / NUM_LEDS) + time) % 360;
+                hsv_to_rgb(hue as u16, 255)
+            }
             Effect::RainbowSections => {
                 // Divide strip into sections, each getting a rainbow color
                 let section_size = NUM_LEDS / RAINBOW.len();

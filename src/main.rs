@@ -66,10 +66,10 @@ const BMI160_CMD_ACCEL_NORMAL: u8 = 0x11;
 const BMI160_ACC_RANGE: u8 = 0x41;
 const BMI160_ACC_RANGE_2G: u8 = 0x03;
 
-const WIFI_NETWORK: &str = "REDACTED";
-const WIFI_PASSWORD: &str = "REDACTED";
+const WIFI_NETWORK: &str = "psimonkey";
+const WIFI_PASSWORD: &str = "ilikemonkeys";
 
-static mut CURRENT_EFFECT: Effect = Effect::RainbowSections;
+static mut CURRENT_EFFECT: Effect = Effect::Off;
 static mut CURRENT_ORIENTATION: char = 'X';
 static mut CURRENT_ACCEL: Accel = Accel { x: 0, y: 0, z: 0 };
 
@@ -117,6 +117,187 @@ fn usize_to_str(mut num: usize, buf: &mut String<16>) {
         i -= 1;
         buf.push(temp[i] as char).unwrap();
     }
+}
+
+fn find_header_value<'a>(headers: &'a [httparse::Header<'a>], name: &str) -> Option<&'a str> {
+    for header in headers {
+        if header.name.eq_ignore_ascii_case(name) {
+            if let Ok(value) = core::str::from_utf8(header.value) {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut h = [
+        0x67452301u32,
+        0xEFCDAB89u32,
+        0x98BADCFEu32,
+        0x10325476u32,
+        0xC3D2E1F0u32,
+    ];
+
+    let len_bits = (data.len() as u64).wrapping_mul(8);
+    let mut chunk = [0u8; 128];
+    chunk[..data.len()].copy_from_slice(data);
+    chunk[data.len()] = 0x80;
+
+    let total_len = data.len() + 1;
+    let pad_len = if total_len % 64 > 56 {
+        64 + 56 - (total_len % 64)
+    } else {
+        56 - (total_len % 64)
+    };
+
+    let padded_len = total_len + pad_len + 8;
+    chunk[total_len + pad_len..total_len + pad_len + 8]
+        .copy_from_slice(&len_bits.to_be_bytes());
+
+    let chunks = padded_len / 64;
+    for chunk_index in 0..chunks {
+        let start = chunk_index * 64;
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            let offset = start + i * 4;
+            w[i] = u32::from_be_bytes([
+                chunk[offset],
+                chunk[offset + 1],
+                chunk[offset + 2],
+                chunk[offset + 3],
+            ]);
+        }
+        for i in 16..80 {
+            let value = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16];
+            w[i] = value.rotate_left(1);
+        }
+
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+
+        for i in 0..80 {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5A827999),
+                20..=39 => (b ^ c ^ d, 0x6ED9EBA1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDC),
+                _ => (b ^ c ^ d, 0xCA62C1D6),
+            };
+            let temp = a.rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(w[i]);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+    }
+
+    let mut out = [0u8; 20];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+fn base64_encode(input: &[u8], output: &mut [u8]) -> usize {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out_index = 0;
+    let mut i = 0;
+
+    while i + 3 <= input.len() {
+        let b0 = input[i];
+        let b1 = input[i + 1];
+        let b2 = input[i + 2];
+        let n = ((b0 as usize) << 16) | ((b1 as usize) << 8) | (b2 as usize);
+        output[out_index] = TABLE[(n >> 18) & 0x3F];
+        output[out_index + 1] = TABLE[(n >> 12) & 0x3F];
+        output[out_index + 2] = TABLE[(n >> 6) & 0x3F];
+        output[out_index + 3] = TABLE[n & 0x3F];
+        out_index += 4;
+        i += 3;
+    }
+
+    let rem = input.len() - i;
+    if rem == 1 {
+        let n = (input[i] as usize) << 16;
+        output[out_index] = TABLE[(n >> 18) & 0x3F];
+        output[out_index + 1] = TABLE[(n >> 12) & 0x3F];
+        output[out_index + 2] = b'=';
+        output[out_index + 3] = b'=';
+        out_index += 4;
+    } else if rem == 2 {
+        let n = ((input[i] as usize) << 16) | ((input[i + 1] as usize) << 8);
+        output[out_index] = TABLE[(n >> 18) & 0x3F];
+        output[out_index + 1] = TABLE[(n >> 12) & 0x3F];
+        output[out_index + 2] = TABLE[(n >> 6) & 0x3F];
+        output[out_index + 3] = b'=';
+        out_index += 4;
+    }
+
+    out_index
+}
+
+fn websocket_accept_key(key: &str, out: &mut String<32>) {
+    const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    let mut buffer = [0u8; 64];
+    let key_bytes = key.as_bytes();
+    buffer[..key_bytes.len()].copy_from_slice(key_bytes);
+    buffer[key_bytes.len()..key_bytes.len() + WS_GUID.len()].copy_from_slice(WS_GUID);
+    let hash = sha1(&buffer[..key_bytes.len() + WS_GUID.len()]);
+    let mut encoded = [0u8; 32];
+    let len = base64_encode(&hash, &mut encoded);
+    let accept = core::str::from_utf8(&encoded[..len]).unwrap();
+    out.clear();
+    out.push_str(accept).unwrap();
+}
+
+fn encode_ws_text_frame(payload: &[u8], buf: &mut [u8]) -> usize {
+    let mut pos = 0;
+    buf[pos] = 0x81;
+    pos += 1;
+
+    let len = payload.len();
+    if len <= 125 {
+        buf[pos] = len as u8;
+        pos += 1;
+    } else if len <= 65535 {
+        buf[pos] = 126;
+        pos += 1;
+        buf[pos..pos + 2].copy_from_slice(&(len as u16).to_be_bytes());
+        pos += 2;
+    } else {
+        buf[pos] = 127;
+        pos += 1;
+        buf[pos..pos + 8].copy_from_slice(&(len as u64).to_be_bytes());
+        pos += 8;
+    }
+
+    buf[pos..pos + len].copy_from_slice(payload);
+    pos + len
+}
+
+async fn socket_write_all(socket: &mut TcpSocket<'_>, mut buf: &[u8]) -> Result<(), embassy_net::tcp::Error> {
+    while !buf.is_empty() {
+        let written = socket.write(buf).await?;
+        if written == 0 {
+            return Err(embassy_net::tcp::Error::ConnectionReset);
+        }
+        buf = &buf[written..];
+    }
+    Ok(())
 }
 
 struct Bmi160;
@@ -356,6 +537,77 @@ async fn web_server(stack: Stack<'static>) {
             Err(httparse::Error::TooManyHeaders) // Or some other error
         };
 
+        if request_complete && matches!(parse_result, Ok(httparse::Status::Complete(_))) {
+            if let Some(path) = request.path {
+                let is_websocket = path == "/ws"
+                    && request.method == Some("GET")
+                    && find_header_value(request.headers, "Upgrade").is_some()
+                    && find_header_value(request.headers, "Connection").is_some()
+                    && find_header_value(request.headers, "Sec-WebSocket-Key").is_some();
+
+                if is_websocket {
+                    let key = find_header_value(request.headers, "Sec-WebSocket-Key").unwrap();
+                    let mut accept = String::<32>::new();
+                    websocket_accept_key(key, &mut accept);
+
+                    let mut handshake = String::<4096>::new();
+                    handshake.push_str("HTTP/1.1 101 Switching Protocols\r\n").unwrap();
+                    handshake.push_str("Upgrade: websocket\r\n").unwrap();
+                    handshake.push_str("Connection: Upgrade\r\n").unwrap();
+                    handshake.push_str("Sec-WebSocket-Accept: ").unwrap();
+                    handshake.push_str(accept.as_str()).unwrap();
+                    handshake.push_str("\r\n\r\n").unwrap();
+
+                    if let Err(e) = socket_write_all(&mut socket, handshake.as_bytes()).await {
+                        println!("WebSocket handshake failed: {:?}", e);
+                        socket.close();
+                        continue;
+                    }
+
+                    println!("WebSocket connected, streaming data...");
+                    let mut frame_buffer = [0u8; 512];
+
+                    loop {
+                        let (effect_name, orientation, accel) = unsafe {
+                            (CURRENT_EFFECT, CURRENT_ORIENTATION, CURRENT_ACCEL)
+                        };
+
+                        let mut json = String::<256>::new();
+                        json.push_str(r#"{"effect":""#).unwrap();
+                        json.push_str(effect_name.as_str()).unwrap();
+                        json.push_str(r#"","orientation":""#).unwrap();
+                        let mut orientation_str = String::<4>::new();
+                        orientation_str.push(orientation).unwrap();
+                        json.push_str(orientation_str.as_str()).unwrap();
+                        json.push_str(r#"","accel":{"x":"#).unwrap();
+                        let mut x_str = String::<16>::new();
+                        let mut y_str = String::<16>::new();
+                        let mut z_str = String::<16>::new();
+                        int_to_str(accel.x, &mut x_str);
+                        int_to_str(accel.y, &mut y_str);
+                        int_to_str(accel.z, &mut z_str);
+                        json.push_str(x_str.as_str()).unwrap();
+                        json.push_str(r#","y":"#).unwrap();
+                        json.push_str(y_str.as_str()).unwrap();
+                        json.push_str(r#","z":"#).unwrap();
+                        json.push_str(z_str.as_str()).unwrap();
+                        json.push_str(r#"}}"#).unwrap();
+
+                        let frame_len = encode_ws_text_frame(json.as_bytes(), &mut frame_buffer);
+                        if let Err(e) = socket_write_all(&mut socket, &frame_buffer[..frame_len]).await {
+                            println!("WebSocket stream write failed: {:?}", e);
+                            break;
+                        }
+
+                        Timer::after(Duration::from_millis(500)).await;
+                    }
+
+                    socket.close();
+                    continue;
+                }
+            }
+        }
+
         // Process the request
         let response: String<4096> = if request_complete && matches!(parse_result, Ok(httparse::Status::Complete(_))) {
             if let Some(path) = request.path {
@@ -470,48 +722,60 @@ async fn web_server(stack: Stack<'static>) {
         
         <button onclick="cycleEffect()">Change LED Effect</button>
         
-        <div class="loading" id="status">Loading...</div>
+        <div class="loading" id="status">Connecting...</div>
     </div>
 
     <script>
-        let lastData = null;
-        
-        async function fetchData() {
-            try {
-                const response = await fetch('/data');
-                const data = await response.json();
-                lastData = data;
-                
-                document.getElementById('orientation').textContent = data.orientation;
-                document.getElementById('accel-x').textContent = data.accel.x;
-                document.getElementById('accel-y').textContent = data.accel.y;
-                document.getElementById('accel-z').textContent = data.accel.z;
-                document.getElementById('effect').textContent = data.effect;
-                document.getElementById('status').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
-            } catch (error) {
-                document.getElementById('status').textContent = 'Error fetching data: ' + error.message;
-            }
+        const orientationEl = document.getElementById('orientation');
+        const xEl = document.getElementById('accel-x');
+        const yEl = document.getElementById('accel-y');
+        const zEl = document.getElementById('accel-z');
+        const effectEl = document.getElementById('effect');
+        const statusEl = document.getElementById('status');
+
+        function updateData(data) {
+            orientationEl.textContent = data.orientation;
+            xEl.textContent = data.accel.x;
+            yEl.textContent = data.accel.y;
+            zEl.textContent = data.accel.z;
+            effectEl.textContent = data.effect;
+            statusEl.textContent = 'Last updated: ' + new Date().toLocaleTimeString();
         }
-        
+
+        const ws = new WebSocket('ws://' + window.location.host + '/ws');
+
+        ws.onopen = () => {
+            statusEl.textContent = 'Connected via WebSocket';
+        };
+
+        ws.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                updateData(data);
+            } catch (e) {
+                statusEl.textContent = 'Invalid WebSocket data';
+            }
+        };
+
+        ws.onclose = () => {
+            statusEl.textContent = 'WebSocket disconnected';
+        };
+
+        ws.onerror = () => {
+            statusEl.textContent = 'WebSocket error';
+        };
+
         async function cycleEffect() {
             try {
                 const response = await fetch('/effect', { method: 'POST' });
                 const result = await response.json();
                 if (result.status === 'ok') {
-                    document.getElementById('status').textContent = 'Effect changed!';
-                    // Refresh data immediately to show new effect
-                    setTimeout(fetchData, 100);
+                    statusEl.textContent = 'Effect changed!';
                 }
             } catch (error) {
-                document.getElementById('status').textContent = 'Error changing effect: ' + error.message;
+                statusEl.textContent = 'Error changing effect: ' + error.message;
             }
         }
-        
-        // Auto-refresh every 500ms
-        setInterval(fetchData, 500);
-        
-        // Initial load
-        fetchData();
     </script>
 </body>
 </html>"#;
@@ -541,8 +805,7 @@ async fn web_server(stack: Stack<'static>) {
             response
         };
 
-        let r = socket.write(response.as_bytes()).await;
-        if let Err(e) = r {
+        if let Err(e) = socket_write_all(&mut socket, response.as_bytes()).await {
             println!("flush error: {:?}", e);
         } else {
             println!("Flush completed successfully");
@@ -703,13 +966,17 @@ async fn main(spawner: Spawner) -> ! {
         .with_pin(peripherals.GPIO7);
     println!("RMT and LED control configured");
 
-    let mut pulses = [PulseCode::default(); 20 * 24 + 1];
+    let mut pulses = [PulseCode::default(); 32 * 24 + 1];
 
-    let effects = Effect::all();
-    let mut effect_index = 0;
-    let mut effect_time = 0usize;
-    const EFFECT_DURATION: usize = 250; // 250 * 80ms = 20 seconds
-    let mut animations_enabled = false;
+
+
+    // --- Button for effect cycling (GPIO10, pull-up, debounced) ---
+    use esp_hal::gpio::{Input, InputConfig, Pull};
+    let button_config = InputConfig::default().with_pull(Pull::Up);
+    let mut button = Input::new(peripherals.GPIO10, button_config);
+    let mut last_button_state = true;
+    let mut last_debounce_time = embassy_time::Instant::now();
+    const DEBOUNCE_MS: u64 = 50;
 
     println!("All initialization complete! Starting main loop...");
     if let Some(addr) = ip_address {
@@ -723,73 +990,38 @@ async fn main(spawner: Spawner) -> ! {
         let accel_data = Bmi160::read_accel(&mut i2c, &mut delay).unwrap();
         let orientation = accel_data.dominant_axis();
 
+        // Handle LED animations
+        let current_effect = unsafe { CURRENT_EFFECT };
+        let mut colors = [RGB8::new(0, 0, 0); NUM_LEDS];
+        update_leds(&mut colors, current_effect, 0);
+
+        encode_ws2812(&colors, &mut pulses);
+        let transaction = channel.transmit(&pulses).unwrap();
+        channel = transaction.wait().unwrap();
+
         // Update shared state
+        // --- Button debounce and effect cycling ---
+        let reading = button.is_low(); // pressed = low
+        let now = embassy_time::Instant::now();
+        if reading != last_button_state {
+            last_debounce_time = now;
+        }
+        if now.duration_since(last_debounce_time).as_millis() as u64 > DEBOUNCE_MS {
+            // Button state stable
+            if !last_button_state && reading {
+                // Button released (low->high): cycle effect
+                println!("Button pressed: cycling LED effect");
+                unsafe {
+                    let current_index = Effect::all().iter().position(|&e| e == CURRENT_EFFECT).unwrap_or(0);
+                    let next_index = (current_index + 1) % Effect::all().len();
+                    CURRENT_EFFECT = Effect::all()[next_index];
+                }
+            }
+        }
+        last_button_state = reading;
         unsafe {
             CURRENT_ORIENTATION = orientation;
             CURRENT_ACCEL = accel_data;
-        }
-
-        // Check for positive Z acceleration to enable animations
-        if !animations_enabled && accel_data.z > 500 {  // Threshold for positive Z acceleration
-            animations_enabled = true;
-            effect_time = 0;  // Reset effect timing
-            effect_index = 0; // Start with first effect
-            println!("Animations enabled! Starting LED effects...");
-        }
-
-        let width = DISPLAY_WIDTH as i32;
-        let height = DISPLAY_HEIGHT as i32;
-        let text_width = 6;
-        let text_height = 10;
-        let x = (width - text_width) / 2;
-        let y = (height - text_height) / 2;
-
-        display_buffer.clear();
-        let message = if animations_enabled {
-            match orientation {
-                'X' => "X*",
-                'Y' => "Y*",
-                'Z' => "Z*",
-                _ => "?*",
-            }
-        } else {
-            match orientation {
-                'X' => "X",
-                'Y' => "Y",
-                'Z' => "Z",
-                _ => "?",
-            }
-        };
-        Text::new(message, Point::new(x, y), text_style)
-            .draw(&mut display_buffer)
-            .unwrap();
-        flush_display(&mut i2c, &display_buffer);
-
-        // Handle LED animations
-        if animations_enabled {
-            let current_effect = effects[effect_index];
-            unsafe {
-                CURRENT_EFFECT = current_effect;
-            }
-            let mut colors = [RGB8::new(0, 0, 0); NUM_LEDS];
-            update_leds(&mut colors, current_effect, effect_time);
-
-            encode_ws2812(&colors, &mut pulses);
-            let transaction = channel.transmit(&pulses).unwrap();
-            channel = transaction.wait().unwrap();
-
-            // Cycle through effects
-            effect_time = effect_time.wrapping_add(1);
-            if effect_time >= EFFECT_DURATION {
-                effect_time = 0;
-                effect_index = (effect_index + 1) % effects.len();
-            }
-        } else {
-            // LEDs off
-            let colors = [RGB8::new(0, 0, 0); NUM_LEDS];
-            encode_ws2812(&colors, &mut pulses);
-            let transaction = channel.transmit(&pulses).unwrap();
-            channel = transaction.wait().unwrap();
         }
 
         Timer::after(Duration::from_millis(80)).await;
