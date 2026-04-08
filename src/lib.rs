@@ -20,7 +20,7 @@ pub const RAINBOW: [RGB8; 7] = [
 
 use core::fmt;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum Effect {
     RainbowSections,
     WaveChase,
@@ -40,6 +40,14 @@ impl fmt::Display for Effect {
 impl Effect {
     pub const fn all() -> [Effect; 3] {
         [Effect::RainbowSections, Effect::WaveChase, Effect::AlternatingGlow]
+    }
+    
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Effect::RainbowSections => "Rainbow Sections",
+            Effect::WaveChase => "Wave Chase",
+            Effect::AlternatingGlow => "Alternating Glow",
+        }
     }
 }
 

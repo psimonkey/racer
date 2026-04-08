@@ -33,6 +33,8 @@ use embassy_net::{
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_alloc as _;
+use heapless::String;
+// use ufmt::uwriteln;
 use esp_hal::{
     clock::CpuClock,
     interrupt::software::SoftwareInterruptControl,
@@ -40,7 +42,7 @@ use esp_hal::{
     rng::Rng,
     timer::timg::TimerGroup,
 };
-use esp_println::{print, println};
+use esp_println::println;
 use esp_radio::wifi::{
     Config,
     ControllerConfig,
@@ -48,6 +50,7 @@ use esp_radio::wifi::{
     sta::StationConfig,
 };
 use static_cell::StaticCell;
+use httparse::{Request, EMPTY_HEADER};
 
 const DISPLAY_WIDTH: usize = 72;
 const DISPLAY_HEIGHT: usize = 40;
@@ -68,6 +71,53 @@ const WIFI_PASSWORD: &str = "REDACTED";
 
 static mut CURRENT_EFFECT: Effect = Effect::RainbowSections;
 static mut CURRENT_ORIENTATION: char = 'X';
+static mut CURRENT_ACCEL: Accel = Accel { x: 0, y: 0, z: 0 };
+
+// Simple integer to string conversion (handles negative numbers)
+fn int_to_str(mut num: i16, buf: &mut String<16>) {
+    if num == 0 {
+        buf.push('0').unwrap();
+        return;
+    }
+    let negative = num < 0;
+    if negative {
+        num = -num;
+    }
+    let mut temp = [0u8; 16];
+    let mut i = 0;
+    let mut n = num as usize;
+    while n > 0 {
+        temp[i] = (n % 10) as u8 + b'0';
+        n /= 10;
+        i += 1;
+    }
+    if negative {
+        buf.push('-').unwrap();
+    }
+    while i > 0 {
+        i -= 1;
+        buf.push(temp[i] as char).unwrap();
+    }
+}
+
+// Simple usize to string conversion (for Content-Length)
+fn usize_to_str(mut num: usize, buf: &mut String<16>) {
+    if num == 0 {
+        buf.push('0').unwrap();
+        return;
+    }
+    let mut temp = [0u8; 16];
+    let mut i = 0;
+    while num > 0 {
+        temp[i] = (num % 10) as u8 + b'0';
+        num /= 10;
+        i += 1;
+    }
+    while i > 0 {
+        i -= 1;
+        buf.push(temp[i] as char).unwrap();
+    }
+}
 
 struct Bmi160;
 
@@ -219,9 +269,31 @@ async fn net_task(mut runner: Runner<'static, Interface<'static>>) {
 }
 
 #[embassy_executor::task]
+async fn wifi_controller_task(mut controller: esp_radio::wifi::WifiController<'static>) {
+    loop {
+        println!("WiFi: Attempting to connect...");
+        match controller.connect_async().await {
+            Ok(info) => {
+                println!("WiFi: Connected successfully! Info: {:?}", info);
+                
+                // Wait for disconnect event
+                let disconnect_info = controller.wait_for_disconnect_async().await.ok();
+                println!("WiFi: Disconnected: {:?}", disconnect_info);
+            }
+            Err(e) => {
+                println!("WiFi: Failed to connect: {:?}", e);
+            }
+        }
+        
+        // Retry connection after 5 seconds
+        Timer::after(Duration::from_millis(5000)).await;
+    }
+}
+
+#[embassy_executor::task]
 async fn web_server(stack: Stack<'static>) {
     let mut rx_buffer = [0; 1536];
-    let mut tx_buffer = [0; 1536];
+    let mut tx_buffer = [0; 4096];
 
     loop {
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
@@ -243,68 +315,241 @@ async fn web_server(stack: Stack<'static>) {
 
         println!("Web server: Client connected, processing request...");
 
-        let mut buffer = [0u8; 1024];
-        let mut pos = 0;
+        // Read the HTTP request
+        let mut request_data = heapless::Vec::<u8, 1024>::new();
+
+        // Read until we have a complete HTTP request
+        let mut request_complete = false;
         loop {
-            match socket.read(&mut buffer).await {
+            let mut temp_buf = [0u8; 256];
+            match socket.read(&mut temp_buf).await {
                 Ok(0) => {
                     println!("read EOF");
                     break;
                 }
                 Ok(len) => {
-                    let to_print =
-                        unsafe { core::str::from_utf8_unchecked(&buffer[..(pos + len)]) };
-
-                    if to_print.contains("\r\n\r\n") {
-                        print!("{}", to_print);
-                        println!();
+                    if request_data.extend_from_slice(&temp_buf[..len]).is_err() {
+                        println!("Request too large");
                         break;
                     }
-
-                    pos += len;
+                    
+                    // Check if we have a complete HTTP request (ends with \r\n\r\n)
+                    if request_data.len() >= 4 && 
+                       request_data[request_data.len()-4..] == [b'\r', b'\n', b'\r', b'\n'] {
+                        request_complete = true;
+                        break;
+                    }
                 }
                 Err(e) => {
                     println!("read error: {:?}", e);
                     break;
                 }
-            };
+            }
         }
 
-        // For now, just send a simple response
-        // TODO: Get current effect name and orientation
-        let (effect_name, orientation) = unsafe {
-            (CURRENT_EFFECT, CURRENT_ORIENTATION)
+        // Parse the request if we have complete data
+        let mut headers = [EMPTY_HEADER; 16];
+        let mut request = Request::new(&mut headers);
+        let parse_result = if request_complete {
+            request.parse(&request_data)
+        } else {
+            Err(httparse::Error::TooManyHeaders) // Or some other error
         };
 
-        // Simple HTML response
-        let response = match (effect_name, orientation) {
-            (Effect::RainbowSections, 'X') => "HTTP/1.0 200 OK\r\n\r\n<html><body><h1>Racer Status</h1><p>Current Effect: Rainbow Sections</p><p>Orientation: X</p></body></html>\r\n",
-            (Effect::RainbowSections, 'Y') => "HTTP/1.0 200 OK\r\n\r\n<html><body><h1>Racer Status</h1><p>Current Effect: Rainbow Sections</p><p>Orientation: Y</p></body></html>\r\n",
-            (Effect::RainbowSections, 'Z') => "HTTP/1.0 200 OK\r\n\r\n<html><body><h1>Racer Status</h1><p>Current Effect: Rainbow Sections</p><p>Orientation: Z</p></body></html>\r\n",
-            (Effect::WaveChase, 'X') => "HTTP/1.0 200 OK\r\n\r\n<html><body><h1>Racer Status</h1><p>Current Effect: Wave Chase</p><p>Orientation: X</p></body></html>\r\n",
-            (Effect::WaveChase, 'Y') => "HTTP/1.0 200 OK\r\n\r\n<html><body><h1>Racer Status</h1><p>Current Effect: Wave Chase</p><p>Orientation: Y</p></body></html>\r\n",
-            (Effect::WaveChase, 'Z') => "HTTP/1.0 200 OK\r\n\r\n<html><body><h1>Racer Status</h1><p>Current Effect: Wave Chase</p><p>Orientation: Z</p></body></html>\r\n",
-            (Effect::AlternatingGlow, 'X') => "HTTP/1.0 200 OK\r\n\r\n<html><body><h1>Racer Status</h1><p>Current Effect: Alternating Glow</p><p>Orientation: X</p></body></html>\r\n",
-            (Effect::AlternatingGlow, 'Y') => "HTTP/1.0 200 OK\r\n\r\n<html><body><h1>Racer Status</h1><p>Current Effect: Alternating Glow</p><p>Orientation: Y</p></body></html>\r\n",
-            (Effect::AlternatingGlow, 'Z') => "HTTP/1.0 200 OK\r\n\r\n<html><body><h1>Racer Status</h1><p>Current Effect: Alternating Glow</p><p>Orientation: Z</p></body></html>\r\n",
-            _ => "HTTP/1.0 200 OK\r\n\r\n<html><body><h1>Racer Status</h1><p>Current Effect: Unknown</p><p>Orientation: ?</p></body></html>\r\n",
+        // Process the request
+        let response: String<4096> = if request_complete && matches!(parse_result, Ok(httparse::Status::Complete(_))) {
+            if let Some(path) = request.path {
+                match path {
+                    "/data" => {
+                        // JSON endpoint for sensor data
+                        let (effect_name, orientation, accel) = unsafe {
+                            (CURRENT_EFFECT, CURRENT_ORIENTATION, CURRENT_ACCEL)
+                        };
+                        
+                        // Build JSON response with actual data
+                        let mut json = String::<256>::new();
+                        json.push_str(r#"{"effect":""#).unwrap();
+                        json.push_str(effect_name.as_str()).unwrap();
+                        json.push_str(r#"","orientation":""#).unwrap();
+                        
+                        // Convert orientation char to string
+                        let mut orientation_str = String::<4>::new();
+                        orientation_str.push(orientation).unwrap();
+                        json.push_str(orientation_str.as_str()).unwrap();
+                        
+                        json.push_str(r#"","accel":{"x":"#).unwrap();
+                        
+                        // Convert numbers to strings (simple implementation)
+                        let mut x_str = String::<16>::new();
+                        let mut y_str = String::<16>::new();
+                        let mut z_str = String::<16>::new();
+                        
+                        int_to_str(accel.x, &mut x_str);
+                        int_to_str(accel.y, &mut y_str);
+                        int_to_str(accel.z, &mut z_str);
+                        
+                        json.push_str(x_str.as_str()).unwrap();
+                        json.push_str(r#","y":"#).unwrap();
+                        json.push_str(y_str.as_str()).unwrap();
+                        json.push_str(r#","z":"#).unwrap();
+                        json.push_str(z_str.as_str()).unwrap();
+                        json.push_str(r#"}}"#).unwrap();
+                        
+                        let content_length = json.len();
+                        let mut response = String::<4096>::new();
+                        response.push_str("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ").unwrap();
+                        
+                        let mut cl_str = String::<16>::new();
+                        usize_to_str(content_length, &mut cl_str);
+                        response.push_str(cl_str.as_str()).unwrap();
+                        response.push_str("\r\n\r\n").unwrap();
+                        response.push_str(json.as_str()).unwrap();
+                        response
+                    }
+                    "/effect" if request.method == Some("POST") => {
+                        // Cycle to next effect
+                        unsafe {
+                            let current_index = Effect::all().iter().position(|&e| e == CURRENT_EFFECT).unwrap_or(0);
+                            let next_index = (current_index + 1) % Effect::all().len();
+                            CURRENT_EFFECT = Effect::all()[next_index];
+                        }
+                        
+                        let json = r#"{"status":"ok"}"#;
+                        let content_length = json.len();
+                        let mut response = String::<4096>::new();
+                        response.push_str("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ").unwrap();
+                        
+                        let mut cl_str = String::<16>::new();
+                        usize_to_str(content_length, &mut cl_str);
+                        response.push_str(cl_str.as_str()).unwrap();
+                        response.push_str("\r\n\r\n").unwrap();
+                        response.push_str(json).unwrap();
+                        response
+                    }
+                    _ => {
+                        // Main HTML page
+                        let html = r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Racer Status</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }
+        .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #333; text-align: center; }
+        .status { margin: 20px 0; padding: 15px; border-radius: 5px; }
+        .accel { background: #e8f4fd; border-left: 4px solid #2196F3; }
+        .effect { background: #f3e5f5; border-left: 4px solid #9C27B0; }
+        .orientation { background: #e8f5e8; border-left: 4px solid #4CAF50; }
+        .value { font-size: 24px; font-weight: bold; margin: 10px 0; }
+        button { background: #2196F3; color: white; border: none; padding: 15px 30px; font-size: 18px; border-radius: 5px; cursor: pointer; width: 100%; margin: 20px 0; }
+        button:hover { background: #1976D2; }
+        .loading { color: #666; font-style: italic; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Racer Status</h1>
+        
+        <div class="status orientation">
+            <h3>Orientation</h3>
+            <div class="value" id="orientation">--</div>
+        </div>
+        
+        <div class="status accel">
+            <h3>Accelerometer</h3>
+            <div>X: <span class="value" id="accel-x">--</span></div>
+            <div>Y: <span class="value" id="accel-y">--</span></div>
+            <div>Z: <span class="value" id="accel-z">--</span></div>
+        </div>
+        
+        <div class="status effect">
+            <h3>LED Effect</h3>
+            <div class="value" id="effect">--</div>
+        </div>
+        
+        <button onclick="cycleEffect()">Change LED Effect</button>
+        
+        <div class="loading" id="status">Loading...</div>
+    </div>
+
+    <script>
+        let lastData = null;
+        
+        async function fetchData() {
+            try {
+                const response = await fetch('/data');
+                const data = await response.json();
+                lastData = data;
+                
+                document.getElementById('orientation').textContent = data.orientation;
+                document.getElementById('accel-x').textContent = data.accel.x;
+                document.getElementById('accel-y').textContent = data.accel.y;
+                document.getElementById('accel-z').textContent = data.accel.z;
+                document.getElementById('effect').textContent = data.effect;
+                document.getElementById('status').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+            } catch (error) {
+                document.getElementById('status').textContent = 'Error fetching data: ' + error.message;
+            }
+        }
+        
+        async function cycleEffect() {
+            try {
+                const response = await fetch('/effect', { method: 'POST' });
+                const result = await response.json();
+                if (result.status === 'ok') {
+                    document.getElementById('status').textContent = 'Effect changed!';
+                    // Refresh data immediately to show new effect
+                    setTimeout(fetchData, 100);
+                }
+            } catch (error) {
+                document.getElementById('status').textContent = 'Error changing effect: ' + error.message;
+            }
+        }
+        
+        // Auto-refresh every 500ms
+        setInterval(fetchData, 500);
+        
+        // Initial load
+        fetchData();
+    </script>
+</body>
+</html>"#;
+                        
+                        let content_length = html.len();
+                        let mut response = String::<4096>::new();
+                        response.push_str("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: ").unwrap();
+                        
+                        let mut cl_str = String::<16>::new();
+                        usize_to_str(content_length, &mut cl_str);
+                        response.push_str(cl_str.as_str()).unwrap();
+                        response.push_str("\r\n\r\n").unwrap();
+                        response.push_str(html).unwrap();
+                        response
+                    }
+                }
+            } else {
+                // Invalid request - no path
+                let mut response = String::<4096>::new();
+                response.push_str("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n").unwrap();
+                response
+            }
+        } else {
+            // Invalid request - parsing failed
+            let mut response = String::<4096>::new();
+            response.push_str("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n").unwrap();
+            response
         };
 
         let r = socket.write(response.as_bytes()).await;
         if let Err(e) = r {
-            println!("write error: {:?}", e);
-        }
-
-        let r = socket.flush().await;
-        if let Err(e) = r {
             println!("flush error: {:?}", e);
+        } else {
+            println!("Flush completed successfully");
         }
-        Timer::after(Duration::from_millis(1000)).await;
-
+        
         socket.close();
-        Timer::after(Duration::from_millis(1000)).await;
-
-        socket.abort();
+        Timer::after(Duration::from_millis(100)).await;
     }
 }
 
@@ -342,14 +587,18 @@ async fn main(spawner: Spawner) -> ! {
     );
 
     println!("Starting WiFi controller...");
-    let (_controller, interfaces) = esp_radio::wifi::new(
+    let (controller, interfaces) = esp_radio::wifi::new(
         peripherals.WIFI,
         ControllerConfig::default().with_initial_config(station_config),
     )
     .unwrap();
-    println!("WiFi controller started successfully");
+    println!("WiFi controller created successfully");
 
     let wifi_interface = interfaces.station;
+    
+    println!("Spawning WiFi controller task...");
+    spawner.spawn(wifi_controller_task(controller).unwrap());
+    println!("WiFi controller task spawned");
 
     println!("Setting up network stack with DHCP...");
     let config = embassy_net::Config::dhcpv4(Default::default());
@@ -374,11 +623,40 @@ async fn main(spawner: Spawner) -> ! {
     spawner.spawn(net_task(runner).unwrap());
     println!("Network task spawned");
 
-    // Wait for DHCP
+    // Wait for DHCP with timeout
     println!("Waiting for DHCP configuration...");
-    stack.wait_config_up().await;
-    let config = stack.config_v4().unwrap();
-    println!("DHCP successful! IP address: {}", config.address);
+    
+    let mut ip_address = None;
+    let dhcp_timeout = async {
+        let start = embassy_time::Instant::now();
+        let mut last_report = embassy_time::Instant::now();
+        loop {
+            if let Some(config) = stack.config_v4() {
+                println!("DHCP successful! IP address: {}", config.address);
+                ip_address = Some(config.address);
+                break;
+            }
+            
+            // Print status every 5 seconds
+            if last_report.elapsed() > Duration::from_secs(5) {
+                println!("DHCP waiting... Link up: {}, Elapsed: {}s", 
+                    stack.is_link_up(), 
+                    start.elapsed().as_secs());
+                last_report = embassy_time::Instant::now();
+            }
+            
+            if start.elapsed() > Duration::from_secs(30) {
+                println!("DHCP timeout! No IP address received after 30 seconds");
+                println!("Final network stack link up: {}", stack.is_link_up());
+                println!("Stack resources check: attempting to query stack state");
+                break;
+            }
+            
+            Timer::after(Duration::from_millis(500)).await;
+        }
+    };
+    
+    dhcp_timeout.await;
 
     // Spawn web server task
     println!("Starting web server on port 80...");
@@ -434,7 +712,11 @@ async fn main(spawner: Spawner) -> ! {
     let mut animations_enabled = false;
 
     println!("All initialization complete! Starting main loop...");
-    println!("Device ready. Point your browser to http://{}:80/", config.address);
+    if let Some(addr) = ip_address {
+        println!("Device ready. Point your browser to http://{}:80/", addr);
+    } else {
+        println!("Device ready but no IP address configured yet.");
+    }
 
     loop {
         // Update OLED display and check accelerometer
@@ -444,6 +726,7 @@ async fn main(spawner: Spawner) -> ! {
         // Update shared state
         unsafe {
             CURRENT_ORIENTATION = orientation;
+            CURRENT_ACCEL = accel_data;
         }
 
         // Check for positive Z acceleration to enable animations
