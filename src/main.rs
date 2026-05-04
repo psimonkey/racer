@@ -70,9 +70,17 @@ const BMI160_ACC_RANGE_2G: u8 = 0x03;
 const WIFI_NETWORK: &str = "psimonkey";
 const WIFI_PASSWORD: &str = "ilikemonkeys";
 
-// BMI160 at ±2g: 16384 LSB = 1g
-const RACE_START_THRESHOLD: i16 = 1500;  // ~0.09g sustained positive X
-const RACE_END_THRESHOLD: i32 = -4000;   // delta between consecutive 80ms readings
+// BMI160 at ±2g: 16384 LSB = 1g.
+// Race detection uses a baseline calibrated when entering RaceReady (car stationary on
+// incline), then integrates deviation from that baseline to estimate velocity.
+const READY_DELAY_TICKS: u16 = 38;     // 38 × 80ms ≈ 3 s before start detection; baseline averaged throughout
+const VELOCITY_NOISE_FLOOR: i32 = 200; // ignore deviations smaller than this (sensor noise)
+const RACE_START_VELOCITY: i32 = 4000; // |Σ deviation| to declare race started
+const MIN_RACE_TICKS: u16 = 6;         // ~480ms minimum race time before end-stop detection
+// During Racing, 3 extra reads are interleaved at 20ms intervals within each 80ms tick,
+// giving effective 20ms sampling to catch brief impact spikes.
+const IMPACT_DELTA: i32 = 5000;        // |delta LSB| over 20ms indicating end-stop hit
+const REBOOT_HOLD_TICKS: u8 = 63;      // 63 × 80ms ≈ 5 s button hold to reboot
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum RaceMode { Display, RaceReady, Racing, RaceOver }
@@ -103,16 +111,27 @@ static mut CURRENT_ACCEL: Accel = Accel { x: 0, y: 0, z: 0 };
 static mut CURRENT_DISPLAY: [u8; DISPLAY_WIDTH * DISPLAY_PAGES] = [0; DISPLAY_WIDTH * DISPLAY_PAGES];
 static mut RACE_START_MS: u64 = 0;
 static mut RACE_ELAPSED_MS: u64 = 0;
+static mut X_INCLINE_BASELINE: i32 = 0; // X reading while stationary on incline
+static mut VELOCITY_EST: i32 = 0;       // Σ(accel_x - baseline), proxy for motion onset
+static mut READY_TICKS: u16 = 0;        // ticks spent in RaceReady settling/detecting
+static mut RACE_TICKS: u16 = 0;         // ticks elapsed since race start
 
 // SAFETY: Single-core cooperative async. Tasks only switch at .await points, so
 // these reads/writes are never interleaved within a single task's non-async section.
 fn current_mode() -> RaceMode { unsafe { CURRENT_MODE } }
 fn enter_mode(mode: RaceMode) {
-    if mode == RaceMode::Racing {
-        unsafe {
+    match mode {
+        RaceMode::RaceReady => unsafe {
+            X_INCLINE_BASELINE = 0;
+            VELOCITY_EST = 0;
+            READY_TICKS = 0;
+        },
+        RaceMode::Racing => unsafe {
             RACE_START_MS = embassy_time::Instant::now().as_millis();
             RACE_ELAPSED_MS = 0;
-        }
+            RACE_TICKS = 0;
+        },
+        _ => {}
     }
     unsafe { CURRENT_MODE = mode; }
 }
@@ -134,6 +153,14 @@ fn set_display(buf: &[u8; DISPLAY_WIDTH * DISPLAY_PAGES]) { unsafe { CURRENT_DIS
 fn race_elapsed_ms() -> u64 { unsafe { RACE_ELAPSED_MS } }
 fn set_race_elapsed_ms(ms: u64) { unsafe { RACE_ELAPSED_MS = ms; } }
 fn race_start_ms() -> u64 { unsafe { RACE_START_MS } }
+fn x_incline_baseline() -> i32 { unsafe { X_INCLINE_BASELINE } }
+fn set_x_incline_baseline(v: i32) { unsafe { X_INCLINE_BASELINE = v; } }
+fn velocity_est() -> i32 { unsafe { VELOCITY_EST } }
+fn add_velocity(d: i32) { unsafe { VELOCITY_EST = VELOCITY_EST.saturating_add(d); } }
+fn ready_ticks() -> u16 { unsafe { READY_TICKS } }
+fn inc_ready_ticks() { unsafe { READY_TICKS = READY_TICKS.saturating_add(1); } }
+fn race_ticks() -> u16 { unsafe { RACE_TICKS } }
+fn inc_race_ticks() { unsafe { RACE_TICKS = RACE_TICKS.saturating_add(1); } }
 
 // Simple integer to string conversion (handles negative numbers)
 fn int_to_str(mut num: i16, buf: &mut String<16>) {
@@ -1128,6 +1155,7 @@ async fn main(spawner: Spawner) -> ! {
     let button = Input::new(peripherals.GPIO10, button_config);
     let mut last_button_state = false;
     let mut button_cooldown: u8 = 0;
+    let mut button_hold_ticks: u8 = 0;
 
     println!("All initialization complete! Starting main loop...");
     if let Some(addr) = ip_address {
@@ -1145,15 +1173,31 @@ async fn main(spawner: Spawner) -> ! {
 
         match current_mode() {
             RaceMode::RaceReady => {
-                if accel_data.x > RACE_START_THRESHOLD {
-                    enter_mode(RaceMode::Racing);
+                let rt = ready_ticks();
+                if rt < READY_DELAY_TICKS {
+                    // Refine baseline average throughout the 3-second delay.
+                    // X_INCLINE_BASELINE starts at 0 so the first sample gets full weight.
+                    let cur = x_incline_baseline();
+                    set_x_incline_baseline(
+                        (cur * rt as i32 + accel_data.x as i32) / (rt as i32 + 1),
+                    );
+                    inc_ready_ticks();
+                } else {
+                    // Integrate deviation from the incline baseline to estimate motion.
+                    let dev = accel_data.x as i32 - x_incline_baseline();
+                    add_velocity(if dev.abs() > VELOCITY_NOISE_FLOOR { dev } else { 0 });
+                    if velocity_est().abs() > RACE_START_VELOCITY {
+                        enter_mode(RaceMode::Racing);
+                    }
                 }
             }
             RaceMode::Racing => {
+                inc_race_ticks();
                 let elapsed = embassy_time::Instant::now().as_millis() - race_start_ms();
                 set_race_elapsed_ms(elapsed);
-                let delta = (accel_data.x as i32) - (prev_x as i32);
-                if delta < RACE_END_THRESHOLD {
+                // End-stop impact: a large single-tick spike in either direction.
+                let delta_x = (accel_data.x as i32) - (prev_x as i32);
+                if race_ticks() > MIN_RACE_TICKS && delta_x.abs() > IMPACT_DELTA {
                     enter_mode(RaceMode::RaceOver);
                 }
             }
@@ -1216,14 +1260,40 @@ async fn main(spawner: Spawner) -> ! {
         channel = transaction.wait().unwrap();
 
         let reading = button.is_low();
-        if reading && !last_button_state && button_cooldown == 0 {
-            println!("Button pressed: cycling mode");
-            cycle_mode();
-            button_cooldown = 5;
+        if reading {
+            button_hold_ticks = button_hold_ticks.saturating_add(1);
+            if button_hold_ticks >= REBOOT_HOLD_TICKS {
+                println!("Button held 5s: rebooting");
+                esp_hal::system::software_reset();
+            }
+        } else {
+            // Fire cycle on release so a long hold never also cycles the mode.
+            if last_button_state && button_hold_ticks > 0 && button_cooldown == 0 {
+                println!("Button pressed: cycling mode");
+                cycle_mode();
+                button_cooldown = 5;
+            }
+            button_hold_ticks = 0;
         }
         last_button_state = reading;
         if button_cooldown > 0 { button_cooldown -= 1; }
 
-        Timer::after(Duration::from_millis(80)).await;
+        // During Racing, interleave 3 extra accel reads at 20ms intervals so that the
+        // effective sampling period is 20ms — necessary to catch brief end-stop impacts.
+        if current_mode() == RaceMode::Racing {
+            for _ in 0..3 {
+                Timer::after(Duration::from_millis(20)).await;
+                let s = Bmi160::read_accel(&mut i2c).unwrap();
+                let d = (s.x as i32) - (prev_x as i32);
+                prev_x = s.x;
+                if race_ticks() > MIN_RACE_TICKS && d.abs() > IMPACT_DELTA {
+                    enter_mode(RaceMode::RaceOver);
+                    break;
+                }
+            }
+            Timer::after(Duration::from_millis(20)).await;
+        } else {
+            Timer::after(Duration::from_millis(80)).await;
+        }
     }
 }
