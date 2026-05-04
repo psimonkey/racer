@@ -9,6 +9,7 @@
 #![no_main]
 
 use core::convert::Infallible;
+use core::net::Ipv4Addr;
 use embedded_graphics::{
     mono_font::{ascii::{FONT_6X10, FONT_10X20}, MonoTextStyleBuilder},
     pixelcolor::BinaryColor,
@@ -25,9 +26,11 @@ use racer::{Accel, Axis, Effect, update_leds, TOTAL_LEDS};
 
 use embassy_net::{
     IpListenEndpoint,
+    Ipv4Cidr,
     Runner,
     Stack,
     StackResources,
+    StaticConfigV4,
     tcp::TcpSocket,
 };
 use embassy_executor::Spawner;
@@ -43,10 +46,11 @@ use esp_hal::{
 };
 use esp_println::println;
 use esp_radio::wifi::{
+    AuthenticationMethod,
     Config,
     ControllerConfig,
     Interface,
-    sta::StationConfig,
+    ap::AccessPointConfig,
 };
 use static_cell::StaticCell;
 use httparse::{Request, EMPTY_HEADER};
@@ -67,8 +71,8 @@ const BMI160_CMD_ACCEL_NORMAL: u8 = 0x11;
 const BMI160_ACC_RANGE: u8 = 0x41;
 const BMI160_ACC_RANGE_2G: u8 = 0x03;
 
-const WIFI_NETWORK: &str = "psimonkey";
-const WIFI_PASSWORD: &str = "ilikemonkeys";
+const AP_SSID: &str = "racer";
+const AP_IP: &str = "10.20.90.1";
 
 // BMI160 at ±2g: 16384 LSB = 1g.
 // Race detection uses a baseline calibrated when entering RaceReady (car stationary on
@@ -780,20 +784,54 @@ async fn net_task(mut runner: Runner<'static, Interface<'static>>) {
 }
 
 #[embassy_executor::task]
-async fn wifi_controller_task(mut controller: esp_radio::wifi::WifiController<'static>) {
+async fn wifi_controller_task(controller: esp_radio::wifi::WifiController<'static>) {
     loop {
-        println!("WiFi: Attempting to connect...");
-        match controller.connect_async().await {
-            Ok(info) => {
-                println!("WiFi: Connected successfully! Info: {:?}", info);
-                let disconnect_info = controller.wait_for_disconnect_async().await.ok();
-                println!("WiFi: Disconnected: {:?}", disconnect_info);
+        match controller.wait_for_access_point_connected_event_async().await {
+            Ok(esp_radio::wifi::AccessPointStationEventInfo::Connected(info)) => {
+                println!("AP: station connected: {:?}", info);
             }
-            Err(e) => {
-                println!("WiFi: Failed to connect: {:?}", e);
+            Ok(esp_radio::wifi::AccessPointStationEventInfo::Disconnected(info)) => {
+                println!("AP: station disconnected: {:?}", info);
             }
+            _ => {}
         }
-        Timer::after(Duration::from_millis(5000)).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn dhcp_server_task(stack: Stack<'static>) {
+    use core::net::SocketAddrV4;
+    use edge_dhcp::{
+        io::{self, DEFAULT_SERVER_PORT},
+        server::{Server, ServerOptions},
+    };
+    use edge_nal::UdpBind;
+    use edge_nal_embassy::{Udp, UdpBuffers};
+
+    let ip = Ipv4Addr::new(10, 20, 90, 1);
+    let mut buf = [0u8; 1500];
+    let mut gw_buf = [Ipv4Addr::UNSPECIFIED];
+
+    let buffers = UdpBuffers::<3, 1024, 1024, 10>::new();
+    let unbound = Udp::new(stack, &buffers);
+    let mut bound = unbound
+        .bind(core::net::SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::UNSPECIFIED,
+            DEFAULT_SERVER_PORT,
+        )))
+        .await
+        .unwrap();
+
+    loop {
+        _ = io::server::run(
+            &mut Server::<_, 64>::new_with_et(ip),
+            &ServerOptions::new(ip, Some(&mut gw_buf)),
+            &mut bound,
+            &mut buf,
+        )
+        .await
+        .inspect_err(|e| println!("DHCP server error: {:?}", e));
+        Timer::after(Duration::from_millis(500)).await;
     }
 }
 
@@ -955,8 +993,8 @@ async fn web_server(stack: Stack<'static>) {
                     let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
                     socket_write_all(&mut socket, header).await.ok();
                     socket_write_all(&mut socket, HTML_PAGE.as_bytes()).await.ok();
+                    socket.flush().await.ok();
                     socket.close();
-                    Timer::after(Duration::from_millis(100)).await;
                     continue;
                 }
             }
@@ -1000,8 +1038,8 @@ async fn web_server(stack: Stack<'static>) {
             println!("Flush completed successfully");
         }
 
+        socket.flush().await.ok();
         socket.close();
-        Timer::after(Duration::from_millis(100)).await;
     }
 }
 
@@ -1032,73 +1070,47 @@ async fn main(spawner: Spawner) -> ! {
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
     println!("RTOS started");
 
-    println!("Configuring WiFi for network: {}", WIFI_NETWORK);
-    let station_config = Config::Station(
-        StationConfig::default()
-            .with_ssid(WIFI_NETWORK)
-            .with_password(WIFI_PASSWORD.into()),
+    let gw_ip = Ipv4Addr::new(10, 20, 90, 1);
+    let ap_config = Config::AccessPoint(
+        AccessPointConfig::default()
+            .with_ssid(AP_SSID)
+            .with_auth_method(AuthenticationMethod::None),
     );
 
-    println!("Starting WiFi controller...");
+    println!("Starting WiFi AP '{}'...", AP_SSID);
     let (controller, interfaces) = esp_radio::wifi::new(
         peripherals.WIFI,
-        ControllerConfig::default().with_initial_config(station_config),
+        ControllerConfig::default().with_initial_config(ap_config),
     )
     .unwrap();
-    println!("WiFi controller created successfully");
 
-    let wifi_interface = interfaces.station;
+    let wifi_interface = interfaces.access_point;
 
-    println!("Spawning WiFi controller task...");
-    spawner.spawn(wifi_controller_task(controller).unwrap());
-    println!("WiFi controller task spawned");
-
-    println!("Setting up network stack with DHCP...");
-    let config = embassy_net::Config::dhcpv4(Default::default());
+    let net_config = embassy_net::Config::ipv4_static(StaticConfigV4 {
+        address: Ipv4Cidr::new(gw_ip, 24),
+        gateway: Some(gw_ip),
+        dns_servers: Default::default(),
+    });
 
     let rng = Rng::new();
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
 
     let (stack, runner) = embassy_net::new(
         wifi_interface,
-        config,
+        net_config,
         {
             static STACK_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
             STACK_RESOURCES.init(StackResources::<3>::new())
         },
         seed,
     );
-    println!("Network stack initialized");
 
-    println!("Spawning network task...");
+    spawner.spawn(wifi_controller_task(controller).unwrap());
     spawner.spawn(net_task(runner).unwrap());
-    println!("Network task spawned");
+    spawner.spawn(dhcp_server_task(stack).unwrap());
 
-    println!("Waiting for DHCP configuration...");
-    let mut ip_address = None;
-    let dhcp_timeout = async {
-        let start = embassy_time::Instant::now();
-        let mut last_report = embassy_time::Instant::now();
-        loop {
-            if let Some(config) = stack.config_v4() {
-                println!("DHCP successful! IP address: {}", config.address);
-                ip_address = Some(config.address);
-                break;
-            }
-            if last_report.elapsed() > Duration::from_secs(5) {
-                println!("DHCP waiting... Link up: {}, Elapsed: {}s",
-                    stack.is_link_up(),
-                    start.elapsed().as_secs());
-                last_report = embassy_time::Instant::now();
-            }
-            if start.elapsed() > Duration::from_secs(30) {
-                println!("DHCP timeout after 30 seconds");
-                break;
-            }
-            Timer::after(Duration::from_millis(500)).await;
-        }
-    };
-    dhcp_timeout.await;
+    stack.wait_config_up().await;
+    println!("AP active at http://{}/", AP_IP);
 
     println!("Starting web server on port 80...");
     spawner.spawn(web_server(stack).unwrap());
@@ -1158,11 +1170,7 @@ async fn main(spawner: Spawner) -> ! {
     let mut button_hold_ticks: u8 = 0;
 
     println!("All initialization complete! Starting main loop...");
-    if let Some(addr) = ip_address {
-        println!("Device ready. Point your browser to http://{}:80/", addr);
-    } else {
-        println!("Device ready but no IP address configured yet.");
-    }
+    println!("Device ready. Point browser to http://{}/", AP_IP);
 
     let mut prev_x: i16 = 0;
 
