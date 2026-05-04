@@ -21,6 +21,7 @@ esp-alloc = { path = "../../esp-hal/esp-alloc" }
 esp-radio = { path = "../../esp-hal/esp-radio", features = ["wifi", "esp32c3"] }
 esp-rtos = { path = "../../esp-hal/esp-rtos", features = ["esp-radio", "embassy", "log-04", "esp32c3"] }
 embassy-executor = "0.10.0"
+embassy-futures = { version = "0.1.2", path = "../../embassy/embassy-futures" }
 embassy-net = { version = "0.9.0", features = ["tcp", "udp", "dhcpv4", "proto-ipv4"] }
 embassy-time = "0.5.0"
 heapless = "0.8"

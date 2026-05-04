@@ -4,8 +4,10 @@
 
 use smart_leds::RGB8;
 
-/// Number of LEDs in the strip
+/// Number of LEDs in each set
 pub const NUM_LEDS: usize = 32;
+/// Total number of LEDs across both sets
+pub const TOTAL_LEDS: usize = NUM_LEDS * 2;
 
 /// Rainbow colors
 pub const RAINBOW: [RGB8; 7] = [
@@ -32,14 +34,7 @@ pub enum Effect {
 
 impl fmt::Display for Effect {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Effect::Off => write!(f, "Off"),
-            Effect::BlueRedChase => write!(f, "Blue Red Chase"),
-            Effect::RainbowTravel => write!(f, "Rainbow Travel"),
-            Effect::RainbowSections => write!(f, "Rainbow Sections"),
-            Effect::WaveChase => write!(f, "Wave Chase"),
-            Effect::AlternatingGlow => write!(f, "Alternating Glow"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -47,7 +42,11 @@ impl Effect {
     pub const fn all() -> [Effect; 6] {
         [Effect::Off, Effect::BlueRedChase, Effect::RainbowTravel, Effect::RainbowSections, Effect::WaveChase, Effect::AlternatingGlow]
     }
-    
+
+    pub fn index(self) -> usize {
+        Self::all().iter().position(|&e| e == self).unwrap()
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Effect::Off => "Off",
@@ -60,9 +59,15 @@ impl Effect {
     }
 }
 
-pub fn update_leds(data: &mut [RGB8; NUM_LEDS], effect: Effect, time: usize) {
-    for i in 0..NUM_LEDS {
-        data[i] = match effect {
+pub fn update_leds(data: &mut [RGB8; TOTAL_LEDS], effect: Effect, time: usize) {
+    for i in 0..TOTAL_LEDS {
+        let local = i % NUM_LEDS;
+        let j = if i >= NUM_LEDS {
+            TOTAL_LEDS - 1 - local // Mirror index for second set
+        } else {
+            local
+        };
+        data[j] = match effect {
             Effect::Off => RGB8::default(),
             Effect::BlueRedChase => {
                 // Chasing blue and red LEDs
@@ -72,7 +77,7 @@ pub fn update_leds(data: &mut [RGB8; NUM_LEDS], effect: Effect, time: usize) {
                 } else {
                     NUM_LEDS * 2 - position - 1
                 };
-                if i == led_pos {
+                if local == led_pos {
                     if position < NUM_LEDS {
                         RGB8 { r: 0, g: 0, b: 255 } // Blue
                     } else {
@@ -84,19 +89,19 @@ pub fn update_leds(data: &mut [RGB8; NUM_LEDS], effect: Effect, time: usize) {
             }
             Effect::RainbowTravel => {
                 // Rainbow colors traveling along the strip
-                let hue = ((i as usize * 360 / NUM_LEDS) + time) % 360;
+                let hue = ((local * 360 / NUM_LEDS) + time) % 360;
                 hsv_to_rgb(hue as u16, 255)
             }
             Effect::RainbowSections => {
                 // Divide strip into sections, each getting a rainbow color
                 let section_size = NUM_LEDS / RAINBOW.len();
-                let section = i / section_size;
+                let section = local / section_size;
                 let color_idx = (section + time / 10) % RAINBOW.len();
                 RAINBOW[color_idx]
             }
             Effect::WaveChase => {
                 // Wave effect moving along the strip
-                let wave_position = (time / 2 + i) % (RAINBOW.len() * 2);
+                let wave_position = (time / 2 + local) % (RAINBOW.len() * 2);
                 let color_idx = wave_position % RAINBOW.len();
                 if wave_position < RAINBOW.len() {
                     RAINBOW[color_idx]
@@ -113,7 +118,7 @@ pub fn update_leds(data: &mut [RGB8; NUM_LEDS], effect: Effect, time: usize) {
             }
             Effect::AlternatingGlow => {
                 // Alternating pattern that shifts
-                let pattern = (i + time / 5) % 3;
+                let pattern = (local + time / 5) % 3;
                 match pattern {
                     0 => RAINBOW[(time / 8) % RAINBOW.len()],
                     1 => RGB8::default(),
@@ -161,19 +166,35 @@ pub struct Accel {
     pub z: i16,
 }
 
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub enum Axis {
+    X,
+    Y,
+    Z,
+}
+
+impl Axis {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Axis::X => "X",
+            Axis::Y => "Y",
+            Axis::Z => "Z",
+        }
+    }
+}
+
 impl Accel {
-    /// Determine the dominant axis based on absolute values
-    pub fn dominant_axis(self) -> char {
+    pub fn dominant_axis(self) -> Axis {
         let x = self.x.abs();
         let y = self.y.abs();
         let z = self.z.abs();
 
         if x >= y && x >= z {
-            'X'
+            Axis::X
         } else if y >= x && y >= z {
-            'Y'
+            Axis::Y
         } else {
-            'Z'
+            Axis::Z
         }
     }
 }

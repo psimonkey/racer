@@ -330,7 +330,7 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0641612053b2f34fc250bb63f6630ae75de46e02ade7f457268447081d709ce"
 dependencies = [
- "embassy-futures",
+ "embassy-futures 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "embassy-hal-internal",
  "embassy-sync 0.8.0",
  "embedded-hal 0.2.7",
@@ -371,6 +371,10 @@ name = "embassy-executor-timer-queue"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2fc328bf943af66b80b98755db9106bf7e7471b0cf47dc8559cd9a6be504cc9c"
+
+[[package]]
+name = "embassy-futures"
+version = "0.1.2"
 
 [[package]]
 name = "embassy-futures"
@@ -702,7 +706,7 @@ dependencies = [
  "digest",
  "document-features",
  "embassy-embedded-hal",
- "embassy-futures",
+ "embassy-futures 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "embassy-sync 0.8.0",
  "embedded-can",
  "embedded-hal 1.0.0",
@@ -1399,6 +1403,7 @@ name = "racer"
 version = "0.1.0"
 dependencies = [
  "embassy-executor",
+ "embassy-futures 0.1.2",
  "embassy-net",
  "embassy-time",
  "embedded-graphics",

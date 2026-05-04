@@ -2,7 +2,7 @@
 //!
 //! Uses a 0.42-inch SSD1306 I2C OLED display wired to GPIO5 (SDA) and GPIO6 (SCL).
 //! A BMI160 accelerometer/gyroscope is on the same I2C bus, GPIO5 (SDA) and GPIO6 (SCL).
-//! A string of 20 WS2812B LEDs is driven from GPIO7.
+//! A string of 64 WS2812B LEDs (TOTAL_LEDS) is driven from GPIO7.
 //! Connects to WiFi network "psimonkey" with password "ilikemonkeys" and serves a web page.
 
 #![no_std]
@@ -10,7 +10,7 @@
 
 use core::convert::Infallible;
 use embedded_graphics::{
-    mono_font::{ascii::FONT_6X10, MonoTextStyleBuilder},
+    mono_font::{ascii::FONT_10X20, MonoTextStyleBuilder},
     pixelcolor::BinaryColor,
     prelude::*,
     text::Text,
@@ -21,7 +21,7 @@ use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::rmt::{PulseCode, TxChannelConfig, TxChannelCreator};
 use smart_leds::RGB8;
 
-use racer::{Accel, Effect, update_leds, NUM_LEDS};
+use racer::{Accel, Axis, Effect, update_leds, TOTAL_LEDS};
 
 use embassy_net::{
     IpListenEndpoint,
@@ -55,6 +55,8 @@ use httparse::{Request, EMPTY_HEADER};
 const DISPLAY_WIDTH: usize = 72;
 const DISPLAY_HEIGHT: usize = 40;
 const DISPLAY_PAGES: usize = DISPLAY_HEIGHT / 8;
+// The SSD1306 controller has 128 columns; the 72 physical pixels start at column 28.
+const DISPLAY_COL_OFFSET: u8 = 28;
 const SSD1306_I2C_ADDRESS: u8 = 0x3C;
 const SSD1306_CMD: u8 = 0x00;
 const SSD1306_DATA: u8 = 0x40;
@@ -69,9 +71,66 @@ const BMI160_ACC_RANGE_2G: u8 = 0x03;
 const WIFI_NETWORK: &str = "psimonkey";
 const WIFI_PASSWORD: &str = "ilikemonkeys";
 
+// BMI160 at ±2g: 16384 LSB = 1g
+const RACE_START_THRESHOLD: i16 = 1500;  // ~0.09g sustained positive X
+const RACE_END_THRESHOLD: i32 = -4000;   // delta between consecutive 80ms readings
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum RaceState { Idle, Racing, Finished }
+
+impl RaceState {
+    fn as_str(self) -> &'static str {
+        match self {
+            RaceState::Idle => "Idle",
+            RaceState::Racing => "Racing",
+            RaceState::Finished => "Finished",
+        }
+    }
+}
+
 static mut CURRENT_EFFECT: Effect = Effect::Off;
-static mut CURRENT_ORIENTATION: char = 'X';
+static mut CURRENT_ORIENTATION: Axis = Axis::X;
 static mut CURRENT_ACCEL: Accel = Accel { x: 0, y: 0, z: 0 };
+static mut CURRENT_DISPLAY: [u8; DISPLAY_WIDTH * DISPLAY_PAGES] = [0; DISPLAY_WIDTH * DISPLAY_PAGES];
+static mut RACE_STATE: RaceState = RaceState::Idle;
+static mut RACE_START_MS: u64 = 0;
+static mut RACE_ELAPSED_MS: u64 = 0;
+static mut EFFECTS_ACTIVE: bool = false;
+
+// SAFETY: Single-core cooperative async. Tasks only switch at .await points, so
+// these reads/writes are never interleaved within a single task's non-async section.
+fn current_effect() -> Effect { unsafe { CURRENT_EFFECT } }
+fn set_effect(e: Effect) { unsafe { CURRENT_EFFECT = e; } }
+fn cycle_effect() {
+    set_effect(Effect::all()[(current_effect().index() + 1) % Effect::all().len()]);
+}
+fn current_orientation() -> Axis { unsafe { CURRENT_ORIENTATION } }
+fn set_orientation(a: Axis) { unsafe { CURRENT_ORIENTATION = a; } }
+fn current_accel() -> Accel { unsafe { CURRENT_ACCEL } }
+fn set_accel(a: Accel) { unsafe { CURRENT_ACCEL = a; } }
+fn current_display() -> [u8; DISPLAY_WIDTH * DISPLAY_PAGES] { unsafe { CURRENT_DISPLAY } }
+fn set_display(buf: &[u8; DISPLAY_WIDTH * DISPLAY_PAGES]) { unsafe { CURRENT_DISPLAY = *buf; } }
+fn race_state() -> RaceState { unsafe { RACE_STATE } }
+fn set_race_state(s: RaceState) { unsafe { RACE_STATE = s; } }
+fn race_elapsed_ms() -> u64 { unsafe { RACE_ELAPSED_MS } }
+fn set_race_elapsed_ms(ms: u64) { unsafe { RACE_ELAPSED_MS = ms; } }
+fn race_start_ms() -> u64 { unsafe { RACE_START_MS } }
+fn effects_active() -> bool { unsafe { EFFECTS_ACTIVE } }
+fn set_effects_active(v: bool) { unsafe { EFFECTS_ACTIVE = v; } }
+fn start_race() {
+    unsafe {
+        RACE_START_MS = embassy_time::Instant::now().as_millis();
+        RACE_ELAPSED_MS = 0;
+        RACE_STATE = RaceState::Racing;
+    }
+}
+fn reset_race() {
+    unsafe {
+        RACE_ELAPSED_MS = 0;
+        RACE_START_MS = 0;
+        RACE_STATE = RaceState::Idle;
+    }
+}
 
 // Simple integer to string conversion (handles negative numbers)
 fn int_to_str(mut num: i16, buf: &mut String<16>) {
@@ -117,6 +176,16 @@ fn usize_to_str(mut num: usize, buf: &mut String<16>) {
         i -= 1;
         buf.push(temp[i] as char).unwrap();
     }
+}
+
+fn format_race_time(ms: u64, buf: &mut String<16>) {
+    let secs = ms / 1000;
+    let centis = (ms % 1000) / 10;
+    usize_to_str(secs as usize, buf);
+    buf.push('.').ok();
+    if centis < 10 { buf.push('0').ok(); }
+    usize_to_str(centis as usize, buf);
+    buf.push('s').ok();
 }
 
 fn find_header_value<'a>(headers: &'a [httparse::Header<'a>], name: &str) -> Option<&'a str> {
@@ -289,6 +358,197 @@ fn encode_ws_text_frame(payload: &[u8], buf: &mut [u8]) -> usize {
     pos + len
 }
 
+const HTML_PAGE: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Racer Status</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }
+        .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #333; text-align: center; }
+        .status { margin: 20px 0; padding: 15px; border-radius: 5px; }
+        .accel { background: #e8f4fd; border-left: 4px solid #2196F3; }
+        .effect { background: #f3e5f5; border-left: 4px solid #9C27B0; }
+        .orientation { background: #e8f5e8; border-left: 4px solid #4CAF50; }
+        .lcd { background: #1a1a2e; border-left: 4px solid #00d4ff; }
+        .lcd h3 { color: #ccc; margin: 0 0 10px 0; }
+        .lcd canvas { image-rendering: pixelated; width: 288px; height: 160px; border: 1px solid #333; }
+        .race { background: #fff3e0; border-left: 4px solid #FF9800; }
+        .value { font-size: 24px; font-weight: bold; margin: 10px 0; }
+        button { background: #2196F3; color: white; border: none; padding: 15px 30px; font-size: 18px; border-radius: 5px; cursor: pointer; width: 100%; margin: 10px 0; }
+        button:hover { background: #1976D2; }
+        .btn-race { background: #FF9800; }
+        .btn-race:hover { background: #F57C00; }
+        .btn-reset { background: #FFC107; color: #333; }
+        .btn-reset:hover { background: #FFA000; }
+        .btn-start { background: #4CAF50; }
+        .btn-start:hover { background: #388E3C; }
+        .btn-stop { background: #757575; }
+        .btn-stop:hover { background: #424242; }
+        .btn-reboot { background: #f44336; }
+        .btn-reboot:hover { background: #c62828; }
+        .loading { color: #666; font-style: italic; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Racer Status</h1>
+        <div class="status orientation">
+            <h3>Orientation</h3>
+            <div class="value" id="orientation">--</div>
+        </div>
+        <div class="status accel">
+            <h3>Accelerometer</h3>
+            <div>X: <span class="value" id="accel-x">--</span></div>
+            <div>Y: <span class="value" id="accel-y">--</span></div>
+            <div>Z: <span class="value" id="accel-z">--</span></div>
+        </div>
+        <div class="status effect">
+            <h3>LED Effect</h3>
+            <div class="value" id="effect">--</div>
+        </div>
+        <div class="status lcd">
+            <h3>LCD Display</h3>
+            <canvas id="lcd" width="72" height="40"></canvas>
+        </div>
+        <div class="status race">
+            <h3>Race</h3>
+            <div>State: <span class="value" id="race-state">--</span></div>
+            <div>Time: <span class="value" id="race-time">--</span></div>
+        </div>
+        <button class="btn-start" onclick="startEffects()">Start Effects</button>
+        <button class="btn-stop" onclick="stopEffects()">Stop Effects</button>
+        <button onclick="cycleEffect()">Change LED Effect</button>
+        <button class="btn-race" onclick="startRace()">Start Race</button>
+        <button class="btn-reset" onclick="resetRace()">Reset Race</button>
+        <button class="btn-reboot" onclick="reboot()">Reboot Device</button>
+        <div class="loading" id="status">Connecting...</div>
+    </div>
+    <script>
+        const orientationEl = document.getElementById('orientation');
+        const xEl = document.getElementById('accel-x');
+        const yEl = document.getElementById('accel-y');
+        const zEl = document.getElementById('accel-z');
+        const effectEl = document.getElementById('effect');
+        const raceStateEl = document.getElementById('race-state');
+        const raceTimeEl = document.getElementById('race-time');
+        const statusEl = document.getElementById('status');
+        function formatTime(ms) {
+            const s = Math.floor(ms / 1000);
+            const frac = String(ms % 1000).padStart(3, '0');
+            return s + '.' + frac + 's';
+        }
+        function updateData(data) {
+            orientationEl.textContent = data.orientation;
+            xEl.textContent = data.accel.x;
+            yEl.textContent = data.accel.y;
+            zEl.textContent = data.accel.z;
+            effectEl.textContent = data.effect;
+            if (data.race !== undefined) raceStateEl.textContent = data.race;
+            if (data.elapsed !== undefined) raceTimeEl.textContent = data.race !== 'Idle' ? formatTime(data.elapsed) : '--';
+            statusEl.textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+        }
+        const ws = new WebSocket('ws://' + window.location.host + '/ws');
+        ws.onopen = () => { statusEl.textContent = 'Connected via WebSocket'; };
+        ws.onmessage = (event) => {
+            try { const data = JSON.parse(event.data); updateData(data); if (data.display) drawLcd(data.display); }
+            catch (e) { statusEl.textContent = 'Invalid WebSocket data'; }
+        };
+        ws.onclose = () => { statusEl.textContent = 'WebSocket disconnected'; };
+        ws.onerror = () => { statusEl.textContent = 'WebSocket error'; };
+        const lcdCanvas = document.getElementById('lcd');
+        const lcdCtx = lcdCanvas.getContext('2d');
+        function drawLcd(hex) {
+            const img = lcdCtx.createImageData(72, 40);
+            for (let p = 0; p < 5; p++) {
+                for (let x = 0; x < 72; x++) {
+                    const byte = parseInt(hex.substr((p * 72 + x) * 2, 2), 16);
+                    for (let b = 0; b < 8; b++) {
+                        const on = (byte >> b) & 1;
+                        const i = ((p * 8 + b) * 72 + x) * 4;
+                        img.data[i] = on ? 100 : 0; img.data[i+1] = on ? 200 : 0;
+                        img.data[i+2] = 255; img.data[i+3] = 255;
+                    }
+                }
+            }
+            lcdCtx.putImageData(img, 0, 0);
+        }
+        function cycleEffect() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send('cycle_effect');
+                statusEl.textContent = 'Effect change sent!';
+            } else { statusEl.textContent = 'WebSocket not connected'; }
+        }
+        function startEffects() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send('start_effects');
+                statusEl.textContent = 'Effects started!';
+            } else { statusEl.textContent = 'WebSocket not connected'; }
+        }
+        function stopEffects() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send('stop_effects');
+                statusEl.textContent = 'Effects stopped!';
+            } else { statusEl.textContent = 'WebSocket not connected'; }
+        }
+        function startRace() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send('start_race');
+                statusEl.textContent = 'Race start sent!';
+            } else { statusEl.textContent = 'WebSocket not connected'; }
+        }
+        function resetRace() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send('reset_race');
+                statusEl.textContent = 'Race reset!';
+            } else { statusEl.textContent = 'WebSocket not connected'; }
+        }
+        function reboot() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send('reboot');
+                statusEl.textContent = 'Rebooting...';
+            } else { statusEl.textContent = 'WebSocket not connected'; }
+        }
+    </script>
+</body>
+</html>"#;
+
+fn build_status_json(effect: Effect, orientation: Axis, accel: Accel, race: RaceState, elapsed_ms: u64) -> String<1024> {
+    let mut json = String::<1024>::new();
+    json.push_str(r#"{"effect":""#).unwrap();
+    json.push_str(effect.as_str()).unwrap();
+    json.push_str(r#"","orientation":""#).unwrap();
+    json.push_str(orientation.as_str()).unwrap();
+    json.push_str(r#"","accel":{"x":"#).unwrap();
+    let mut x_str = String::<16>::new();
+    let mut y_str = String::<16>::new();
+    let mut z_str = String::<16>::new();
+    int_to_str(accel.x, &mut x_str);
+    int_to_str(accel.y, &mut y_str);
+    int_to_str(accel.z, &mut z_str);
+    json.push_str(x_str.as_str()).unwrap();
+    json.push_str(r#","y":"#).unwrap();
+    json.push_str(y_str.as_str()).unwrap();
+    json.push_str(r#","z":"#).unwrap();
+    json.push_str(z_str.as_str()).unwrap();
+    json.push_str(r#"},"display":""#).unwrap();
+    let display = current_display();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in display.iter() {
+        json.push(HEX[(byte >> 4) as usize] as char).unwrap();
+        json.push(HEX[(byte & 0x0F) as usize] as char).unwrap();
+    }
+    json.push_str(r#"","race":""#).unwrap();
+    json.push_str(race.as_str()).unwrap();
+    json.push_str(r#"","elapsed":"#).unwrap();
+    let mut elapsed_str = String::<16>::new();
+    usize_to_str(elapsed_ms as usize, &mut elapsed_str);
+    json.push_str(elapsed_str.as_str()).unwrap();
+    json.push('}').unwrap();
+    json
+}
+
 async fn socket_write_all(socket: &mut TcpSocket<'_>, mut buf: &[u8]) -> Result<(), embassy_net::tcp::Error> {
     while !buf.is_empty() {
         let written = socket.write(buf).await?;
@@ -311,7 +571,7 @@ impl Bmi160 {
         Ok(())
     }
 
-    fn read_accel(i2c: &mut I2c<'_, esp_hal::Blocking>, _delay: &mut Delay) -> Result<Accel, ()> {
+    fn read_accel(i2c: &mut I2c<'_, esp_hal::Blocking>) -> Result<Accel, ()> {
         let mut buf = [0u8; 6];
         i2c.write_read(BMI160_I2C_ADDRESS, &[BMI160_ACCEL_DATA], &mut buf).map_err(|_| ())?;
         Ok(Accel {
@@ -429,7 +689,11 @@ fn initialize_display(i2c: &mut I2c<'_, esp_hal::Blocking>, delay: &mut Delay) {
 
 fn flush_display(i2c: &mut I2c<'_, esp_hal::Blocking>, buffer: &DisplayBuffer) {
     for page in 0..DISPLAY_PAGES {
-        let page_commands = [0xB0 | page as u8, 0x00, 0x10];
+        let page_commands = [
+            0xB0 | page as u8,
+            DISPLAY_COL_OFFSET & 0x0F,        // lower column nibble
+            0x10 | (DISPLAY_COL_OFFSET >> 4), // upper column nibble
+        ];
         let mut cmd_packet = [0u8; 4];
         cmd_packet[0] = SSD1306_CMD;
         cmd_packet[1..].copy_from_slice(&page_commands);
@@ -565,44 +829,105 @@ async fn web_server(stack: Stack<'static>) {
                     }
 
                     println!("WebSocket connected, streaming data...");
-                    let mut frame_buffer = [0u8; 512];
+                    let mut frame_buffer = [0u8; 1024];
+                    let mut rx_buf = [0u8; 64];
 
                     loop {
-                        let (effect_name, orientation, accel) = unsafe {
-                            (CURRENT_EFFECT, CURRENT_ORIENTATION, CURRENT_ACCEL)
-                        };
+                        // Race between incoming data from client and a 500ms tick
+                        let timer = Timer::after(Duration::from_millis(500));
+                        let read_fut = socket.read(&mut rx_buf);
 
-                        let mut json = String::<256>::new();
-                        json.push_str(r#"{"effect":""#).unwrap();
-                        json.push_str(effect_name.as_str()).unwrap();
-                        json.push_str(r#"","orientation":""#).unwrap();
-                        let mut orientation_str = String::<4>::new();
-                        orientation_str.push(orientation).unwrap();
-                        json.push_str(orientation_str.as_str()).unwrap();
-                        json.push_str(r#"","accel":{"x":"#).unwrap();
-                        let mut x_str = String::<16>::new();
-                        let mut y_str = String::<16>::new();
-                        let mut z_str = String::<16>::new();
-                        int_to_str(accel.x, &mut x_str);
-                        int_to_str(accel.y, &mut y_str);
-                        int_to_str(accel.z, &mut z_str);
-                        json.push_str(x_str.as_str()).unwrap();
-                        json.push_str(r#","y":"#).unwrap();
-                        json.push_str(y_str.as_str()).unwrap();
-                        json.push_str(r#","z":"#).unwrap();
-                        json.push_str(z_str.as_str()).unwrap();
-                        json.push_str(r#"}}"#).unwrap();
+                        match embassy_futures::select::select(read_fut, timer).await {
+                            embassy_futures::select::Either::First(read_result) => {
+                                match read_result {
+                                    Ok(0) => {
+                                        println!("WebSocket client disconnected");
+                                        break;
+                                    }
+                                    Ok(n) if n >= 2 => {
+                                        let opcode = rx_buf[0] & 0x0F;
+                                        if opcode == 8 {
+                                            // Close frame
+                                            println!("WebSocket close frame received");
+                                            break;
+                                        }
+                                        if opcode == 1 {
+                                            // Text frame - check for cycle_effect command
+                                            let masked = (rx_buf[1] & 0x80) != 0;
+                                            let payload_len = (rx_buf[1] & 0x7F) as usize;
+                                            let payload_start = if masked { 6 } else { 2 };
+                                            if n >= payload_start + payload_len && payload_len <= 32 {
+                                                let mut decoded = [0u8; 32];
+                                                if masked && n >= 6 {
+                                                    let mask = [rx_buf[2], rx_buf[3], rx_buf[4], rx_buf[5]];
+                                                    for i in 0..payload_len {
+                                                        decoded[i] = rx_buf[payload_start + i] ^ mask[i % 4];
+                                                    }
+                                                } else {
+                                                    decoded[..payload_len].copy_from_slice(&rx_buf[payload_start..payload_start + payload_len]);
+                                                }
+                                                if &decoded[..payload_len] == b"cycle_effect" {
+                                                    println!("WebSocket: cycle_effect command");
+                                                    cycle_effect();
+                                                }
+                                                if &decoded[..payload_len] == b"start_race" {
+                                                    println!("WebSocket: start_race command");
+                                                    start_race();
+                                                }
+                                                if &decoded[..payload_len] == b"start_effects" {
+                                                    set_effects_active(true);
+                                                    if current_effect() == Effect::Off { cycle_effect(); }
+                                                }
+                                                if &decoded[..payload_len] == b"stop_effects" {
+                                                    set_effects_active(false);
+                                                    set_effect(Effect::Off);
+                                                }
+                                                if &decoded[..payload_len] == b"reset_race" {
+                                                    reset_race();
+                                                }
+                                                if &decoded[..payload_len] == b"reboot" {
+                                                    esp_hal::system::software_reset();
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        println!("WebSocket read error: {:?}", e);
+                                        break;
+                                    }
+                                }
+                                // After handling incoming data, send a status update immediately
+                            }
+                            embassy_futures::select::Either::Second(_) => {
+                                // Timer fired - send status update
+                            }
+                        }
+
+                        // Send status update
+                        let json = build_status_json(current_effect(), current_orientation(), current_accel(), race_state(), race_elapsed_ms());
 
                         let frame_len = encode_ws_text_frame(json.as_bytes(), &mut frame_buffer);
                         if let Err(e) = socket_write_all(&mut socket, &frame_buffer[..frame_len]).await {
                             println!("WebSocket stream write failed: {:?}", e);
                             break;
                         }
-
-                        Timer::after(Duration::from_millis(500)).await;
                     }
 
                     socket.close();
+                    continue;
+                }
+
+                // Serve the HTML page directly via two writes — the page is too large
+                // to fit in the String<4096> used for API responses.
+                let is_api = path == "/data" ||
+                    (path == "/effect" && request.method == Some("POST"));
+                if !is_api {
+                    let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
+                    socket_write_all(&mut socket, header).await.ok();
+                    socket_write_all(&mut socket, HTML_PAGE.as_bytes()).await.ok();
+                    socket.close();
+                    Timer::after(Duration::from_millis(100)).await;
                     continue;
                 }
             }
@@ -613,40 +938,7 @@ async fn web_server(stack: Stack<'static>) {
             if let Some(path) = request.path {
                 match path {
                     "/data" => {
-                        // JSON endpoint for sensor data
-                        let (effect_name, orientation, accel) = unsafe {
-                            (CURRENT_EFFECT, CURRENT_ORIENTATION, CURRENT_ACCEL)
-                        };
-                        
-                        // Build JSON response with actual data
-                        let mut json = String::<256>::new();
-                        json.push_str(r#"{"effect":""#).unwrap();
-                        json.push_str(effect_name.as_str()).unwrap();
-                        json.push_str(r#"","orientation":""#).unwrap();
-                        
-                        // Convert orientation char to string
-                        let mut orientation_str = String::<4>::new();
-                        orientation_str.push(orientation).unwrap();
-                        json.push_str(orientation_str.as_str()).unwrap();
-                        
-                        json.push_str(r#"","accel":{"x":"#).unwrap();
-                        
-                        // Convert numbers to strings (simple implementation)
-                        let mut x_str = String::<16>::new();
-                        let mut y_str = String::<16>::new();
-                        let mut z_str = String::<16>::new();
-                        
-                        int_to_str(accel.x, &mut x_str);
-                        int_to_str(accel.y, &mut y_str);
-                        int_to_str(accel.z, &mut z_str);
-                        
-                        json.push_str(x_str.as_str()).unwrap();
-                        json.push_str(r#","y":"#).unwrap();
-                        json.push_str(y_str.as_str()).unwrap();
-                        json.push_str(r#","z":"#).unwrap();
-                        json.push_str(z_str.as_str()).unwrap();
-                        json.push_str(r#"}}"#).unwrap();
-                        
+                        let json = build_status_json(current_effect(), current_orientation(), current_accel(), race_state(), race_elapsed_ms());
                         let content_length = json.len();
                         let mut response = String::<4096>::new();
                         response.push_str("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ").unwrap();
@@ -659,12 +951,7 @@ async fn web_server(stack: Stack<'static>) {
                         response
                     }
                     "/effect" if request.method == Some("POST") => {
-                        // Cycle to next effect
-                        unsafe {
-                            let current_index = Effect::all().iter().position(|&e| e == CURRENT_EFFECT).unwrap_or(0);
-                            let next_index = (current_index + 1) % Effect::all().len();
-                            CURRENT_EFFECT = Effect::all()[next_index];
-                        }
+                        cycle_effect();
                         
                         let json = r#"{"status":"ok"}"#;
                         let content_length = json.len();
@@ -679,116 +966,8 @@ async fn web_server(stack: Stack<'static>) {
                         response
                     }
                     _ => {
-                        // Main HTML page
-                        let html = r#"<!DOCTYPE html>
-<html>
-<head>
-    <title>Racer Status</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }
-        .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        h1 { color: #333; text-align: center; }
-        .status { margin: 20px 0; padding: 15px; border-radius: 5px; }
-        .accel { background: #e8f4fd; border-left: 4px solid #2196F3; }
-        .effect { background: #f3e5f5; border-left: 4px solid #9C27B0; }
-        .orientation { background: #e8f5e8; border-left: 4px solid #4CAF50; }
-        .value { font-size: 24px; font-weight: bold; margin: 10px 0; }
-        button { background: #2196F3; color: white; border: none; padding: 15px 30px; font-size: 18px; border-radius: 5px; cursor: pointer; width: 100%; margin: 20px 0; }
-        button:hover { background: #1976D2; }
-        .loading { color: #666; font-style: italic; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Racer Status</h1>
-        
-        <div class="status orientation">
-            <h3>Orientation</h3>
-            <div class="value" id="orientation">--</div>
-        </div>
-        
-        <div class="status accel">
-            <h3>Accelerometer</h3>
-            <div>X: <span class="value" id="accel-x">--</span></div>
-            <div>Y: <span class="value" id="accel-y">--</span></div>
-            <div>Z: <span class="value" id="accel-z">--</span></div>
-        </div>
-        
-        <div class="status effect">
-            <h3>LED Effect</h3>
-            <div class="value" id="effect">--</div>
-        </div>
-        
-        <button onclick="cycleEffect()">Change LED Effect</button>
-        
-        <div class="loading" id="status">Connecting...</div>
-    </div>
-
-    <script>
-        const orientationEl = document.getElementById('orientation');
-        const xEl = document.getElementById('accel-x');
-        const yEl = document.getElementById('accel-y');
-        const zEl = document.getElementById('accel-z');
-        const effectEl = document.getElementById('effect');
-        const statusEl = document.getElementById('status');
-
-        function updateData(data) {
-            orientationEl.textContent = data.orientation;
-            xEl.textContent = data.accel.x;
-            yEl.textContent = data.accel.y;
-            zEl.textContent = data.accel.z;
-            effectEl.textContent = data.effect;
-            statusEl.textContent = 'Last updated: ' + new Date().toLocaleTimeString();
-        }
-
-        const ws = new WebSocket('ws://' + window.location.host + '/ws');
-
-        ws.onopen = () => {
-            statusEl.textContent = 'Connected via WebSocket';
-        };
-
-        ws.onmessage = (event) => {
-            try {
-                const data = JSON.parse(event.data);
-                updateData(data);
-            } catch (e) {
-                statusEl.textContent = 'Invalid WebSocket data';
-            }
-        };
-
-        ws.onclose = () => {
-            statusEl.textContent = 'WebSocket disconnected';
-        };
-
-        ws.onerror = () => {
-            statusEl.textContent = 'WebSocket error';
-        };
-
-        async function cycleEffect() {
-            try {
-                const response = await fetch('/effect', { method: 'POST' });
-                const result = await response.json();
-                if (result.status === 'ok') {
-                    statusEl.textContent = 'Effect changed!';
-                }
-            } catch (error) {
-                statusEl.textContent = 'Error changing effect: ' + error.message;
-            }
-        }
-    </script>
-</body>
-</html>"#;
-                        
-                        let content_length = html.len();
                         let mut response = String::<4096>::new();
-                        response.push_str("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: ").unwrap();
-                        
-                        let mut cl_str = String::<16>::new();
-                        usize_to_str(content_length, &mut cl_str);
-                        response.push_str(cl_str.as_str()).unwrap();
-                        response.push_str("\r\n\r\n").unwrap();
-                        response.push_str(html).unwrap();
+                        response.push_str("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").unwrap();
                         response
                     }
                 }
@@ -817,7 +996,8 @@ async fn web_server(stack: Stack<'static>) {
 }
 
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    println!("PANIC: {}", info);
     loop {}
 }
 
@@ -947,7 +1127,7 @@ async fn main(spawner: Spawner) -> ! {
     println!("BMI160 accelerometer initialized");
 
     let text_style = MonoTextStyleBuilder::new()
-        .font(&FONT_6X10)
+        .font(&FONT_10X20)
         .text_color(BinaryColor::On)
         .build();
 
@@ -966,17 +1146,17 @@ async fn main(spawner: Spawner) -> ! {
         .with_pin(peripherals.GPIO7);
     println!("RMT and LED control configured");
 
-    let mut pulses = [PulseCode::default(); 32 * 24 + 1];
+    let mut pulses = [PulseCode::default(); TOTAL_LEDS * 24 + 1];
 
 
 
-    // --- Button for effect cycling (GPIO10, pull-up, debounced) ---
+    // --- Button for effect cycling (GPIO10, pull-up) ---
     use esp_hal::gpio::{Input, InputConfig, Pull};
     let button_config = InputConfig::default().with_pull(Pull::Up);
-    let mut button = Input::new(peripherals.GPIO10, button_config);
-    let mut last_button_state = true;
-    let mut last_debounce_time = embassy_time::Instant::now();
-    const DEBOUNCE_MS: u64 = 50;
+    let button = Input::new(peripherals.GPIO10, button_config);
+    let mut last_button_state = false;
+    // Cooldown in loop iterations (5 × 80ms = 400ms) to debounce the button.
+    let mut button_cooldown: u8 = 0;
 
     println!("All initialization complete! Starting main loop...");
     if let Some(addr) = ip_address {
@@ -985,44 +1165,70 @@ async fn main(spawner: Spawner) -> ! {
         println!("Device ready but no IP address configured yet.");
     }
 
-    loop {
-        // Update OLED display and check accelerometer
-        let accel_data = Bmi160::read_accel(&mut i2c, &mut delay).unwrap();
-        let orientation = accel_data.dominant_axis();
+    let mut prev_x: i16 = 0;
 
-        // Handle LED animations
-        let current_effect = unsafe { CURRENT_EFFECT };
-        let mut colors = [RGB8::new(0, 0, 0); NUM_LEDS];
-        update_leds(&mut colors, current_effect, 0);
+    loop {
+        let accel_data = Bmi160::read_accel(&mut i2c).unwrap();
+        let axis = accel_data.dominant_axis();
+        set_orientation(axis);
+
+        match race_state() {
+            RaceState::Idle => {
+                if accel_data.x > RACE_START_THRESHOLD {
+                    start_race();
+                }
+            }
+            RaceState::Racing => {
+                let elapsed = embassy_time::Instant::now().as_millis() - race_start_ms();
+                set_race_elapsed_ms(elapsed);
+                let delta = (accel_data.x as i32) - (prev_x as i32);
+                if delta < RACE_END_THRESHOLD {
+                    set_race_state(RaceState::Finished);
+                }
+            }
+            RaceState::Finished => {}
+        }
+        prev_x = accel_data.x;
+        set_accel(accel_data);
+
+        display_buffer.clear();
+        let mut time_str = String::<16>::new();
+        format_race_time(race_elapsed_ms(), &mut time_str);
+        Text::new(time_str.as_str(), Point::new(1, 30), text_style)
+            .draw(&mut display_buffer)
+            .unwrap();
+        flush_display(&mut i2c, &display_buffer);
+        set_display(&display_buffer.buffer);
+
+        let tick = if effects_active() || race_state() == RaceState::Racing {
+            (embassy_time::Instant::now().as_millis() as usize) / 80
+        } else {
+            0
+        };
+        let mut colors = [RGB8::new(0, 0, 0); TOTAL_LEDS];
+        update_leds(&mut colors, current_effect(), tick);
+        for c in colors.iter_mut() {
+            c.r /= 8;
+            c.g /= 8;
+            c.b /= 8;
+        }
 
         encode_ws2812(&colors, &mut pulses);
         let transaction = channel.transmit(&pulses).unwrap();
         channel = transaction.wait().unwrap();
 
-        // Update shared state
-        // --- Button debounce and effect cycling ---
-        let reading = button.is_low(); // pressed = low
-        let now = embassy_time::Instant::now();
-        if reading != last_button_state {
-            last_debounce_time = now;
-        }
-        if now.duration_since(last_debounce_time).as_millis() as u64 > DEBOUNCE_MS {
-            // Button state stable
-            if !last_button_state && reading {
-                // Button released (low->high): cycle effect
-                println!("Button pressed: cycling LED effect");
-                unsafe {
-                    let current_index = Effect::all().iter().position(|&e| e == CURRENT_EFFECT).unwrap_or(0);
-                    let next_index = (current_index + 1) % Effect::all().len();
-                    CURRENT_EFFECT = Effect::all()[next_index];
-                }
+        let reading = button.is_low();
+        if reading && !last_button_state && button_cooldown == 0 {
+            println!("Button pressed!");
+            if race_state() == RaceState::Idle {
+                cycle_effect();
+            } else {
+                reset_race();
             }
+            button_cooldown = 5;
         }
         last_button_state = reading;
-        unsafe {
-            CURRENT_ORIENTATION = orientation;
-            CURRENT_ACCEL = accel_data;
-        }
+        if button_cooldown > 0 { button_cooldown -= 1; }
 
         Timer::after(Duration::from_millis(80)).await;
     }
