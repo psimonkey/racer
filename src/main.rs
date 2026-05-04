@@ -10,7 +10,7 @@
 
 use core::convert::Infallible;
 use embedded_graphics::{
-    mono_font::{ascii::FONT_10X20, MonoTextStyleBuilder},
+    mono_font::{ascii::{FONT_6X10, FONT_10X20}, MonoTextStyleBuilder},
     pixelcolor::BinaryColor,
     prelude::*,
     text::Text,
@@ -34,7 +34,6 @@ use embassy_executor::Spawner;
 use embassy_time::{Duration, Timer};
 use esp_alloc as _;
 use heapless::String;
-// use ufmt::uwriteln;
 use esp_hal::{
     clock::CpuClock,
     interrupt::software::SoftwareInterruptControl,
@@ -76,33 +75,55 @@ const RACE_START_THRESHOLD: i16 = 1500;  // ~0.09g sustained positive X
 const RACE_END_THRESHOLD: i32 = -4000;   // delta between consecutive 80ms readings
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum RaceState { Idle, Racing, Finished }
+enum RaceMode { Display, RaceReady, Racing, RaceOver }
 
-impl RaceState {
+impl RaceMode {
     fn as_str(self) -> &'static str {
         match self {
-            RaceState::Idle => "Idle",
-            RaceState::Racing => "Racing",
-            RaceState::Finished => "Finished",
+            RaceMode::Display => "Display",
+            RaceMode::RaceReady => "Race Ready",
+            RaceMode::Racing => "Racing",
+            RaceMode::RaceOver => "Race Over",
         }
     }
 }
 
-static mut CURRENT_EFFECT: Effect = Effect::Off;
+fn mode_effect(mode: RaceMode) -> Effect {
+    match mode {
+        RaceMode::Display   => Effect::WaveChase,
+        RaceMode::RaceReady => Effect::PulsingGreen,
+        RaceMode::Racing    => Effect::RacingChase,
+        RaceMode::RaceOver  => Effect::Fireworks,
+    }
+}
+
+static mut CURRENT_MODE: RaceMode = RaceMode::Display;
 static mut CURRENT_ORIENTATION: Axis = Axis::X;
 static mut CURRENT_ACCEL: Accel = Accel { x: 0, y: 0, z: 0 };
 static mut CURRENT_DISPLAY: [u8; DISPLAY_WIDTH * DISPLAY_PAGES] = [0; DISPLAY_WIDTH * DISPLAY_PAGES];
-static mut RACE_STATE: RaceState = RaceState::Idle;
 static mut RACE_START_MS: u64 = 0;
 static mut RACE_ELAPSED_MS: u64 = 0;
-static mut EFFECTS_ACTIVE: bool = false;
 
 // SAFETY: Single-core cooperative async. Tasks only switch at .await points, so
 // these reads/writes are never interleaved within a single task's non-async section.
-fn current_effect() -> Effect { unsafe { CURRENT_EFFECT } }
-fn set_effect(e: Effect) { unsafe { CURRENT_EFFECT = e; } }
-fn cycle_effect() {
-    set_effect(Effect::all()[(current_effect().index() + 1) % Effect::all().len()]);
+fn current_mode() -> RaceMode { unsafe { CURRENT_MODE } }
+fn enter_mode(mode: RaceMode) {
+    if mode == RaceMode::Racing {
+        unsafe {
+            RACE_START_MS = embassy_time::Instant::now().as_millis();
+            RACE_ELAPSED_MS = 0;
+        }
+    }
+    unsafe { CURRENT_MODE = mode; }
+}
+fn cycle_mode() {
+    let next = match current_mode() {
+        RaceMode::Display   => RaceMode::RaceReady,
+        RaceMode::RaceReady => RaceMode::Racing,
+        RaceMode::Racing    => RaceMode::RaceOver,
+        RaceMode::RaceOver  => RaceMode::Display,
+    };
+    enter_mode(next);
 }
 fn current_orientation() -> Axis { unsafe { CURRENT_ORIENTATION } }
 fn set_orientation(a: Axis) { unsafe { CURRENT_ORIENTATION = a; } }
@@ -110,27 +131,9 @@ fn current_accel() -> Accel { unsafe { CURRENT_ACCEL } }
 fn set_accel(a: Accel) { unsafe { CURRENT_ACCEL = a; } }
 fn current_display() -> [u8; DISPLAY_WIDTH * DISPLAY_PAGES] { unsafe { CURRENT_DISPLAY } }
 fn set_display(buf: &[u8; DISPLAY_WIDTH * DISPLAY_PAGES]) { unsafe { CURRENT_DISPLAY = *buf; } }
-fn race_state() -> RaceState { unsafe { RACE_STATE } }
-fn set_race_state(s: RaceState) { unsafe { RACE_STATE = s; } }
 fn race_elapsed_ms() -> u64 { unsafe { RACE_ELAPSED_MS } }
 fn set_race_elapsed_ms(ms: u64) { unsafe { RACE_ELAPSED_MS = ms; } }
 fn race_start_ms() -> u64 { unsafe { RACE_START_MS } }
-fn effects_active() -> bool { unsafe { EFFECTS_ACTIVE } }
-fn set_effects_active(v: bool) { unsafe { EFFECTS_ACTIVE = v; } }
-fn start_race() {
-    unsafe {
-        RACE_START_MS = embassy_time::Instant::now().as_millis();
-        RACE_ELAPSED_MS = 0;
-        RACE_STATE = RaceState::Racing;
-    }
-}
-fn reset_race() {
-    unsafe {
-        RACE_ELAPSED_MS = 0;
-        RACE_START_MS = 0;
-        RACE_STATE = RaceState::Idle;
-    }
-}
 
 // Simple integer to string conversion (handles negative numbers)
 fn int_to_str(mut num: i16, buf: &mut String<16>) {
@@ -180,12 +183,13 @@ fn usize_to_str(mut num: usize, buf: &mut String<16>) {
 
 fn format_race_time(ms: u64, buf: &mut String<16>) {
     let secs = ms / 1000;
-    let centis = (ms % 1000) / 10;
+    let millis = ms % 1000;
+    if secs < 10 { buf.push('0').ok(); }
     usize_to_str(secs as usize, buf);
     buf.push('.').ok();
-    if centis < 10 { buf.push('0').ok(); }
-    usize_to_str(centis as usize, buf);
-    buf.push('s').ok();
+    if millis < 100 { buf.push('0').ok(); }
+    if millis < 10 { buf.push('0').ok(); }
+    usize_to_str(millis as usize, buf);
 }
 
 fn find_header_value<'a>(headers: &'a [httparse::Header<'a>], name: &str) -> Option<&'a str> {
@@ -361,31 +365,30 @@ fn encode_ws_text_frame(payload: &[u8], buf: &mut [u8]) -> usize {
 const HTML_PAGE: &str = r#"<!DOCTYPE html>
 <html>
 <head>
-    <title>Racer Status</title>
+    <title>Racer</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }
         .container { max-width: 600px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
         h1 { color: #333; text-align: center; }
         .status { margin: 20px 0; padding: 15px; border-radius: 5px; }
-        .accel { background: #e8f4fd; border-left: 4px solid #2196F3; }
-        .effect { background: #f3e5f5; border-left: 4px solid #9C27B0; }
-        .orientation { background: #e8f5e8; border-left: 4px solid #4CAF50; }
         .lcd { background: #1a1a2e; border-left: 4px solid #00d4ff; }
-        .lcd h3 { color: #ccc; margin: 0 0 10px 0; }
+        .lcd-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+        .lcd-header h3 { color: #ccc; margin: 0; }
+        .mode-tag { color: #00d4ff; font-weight: bold; font-size: 18px; }
         .lcd canvas { image-rendering: pixelated; width: 288px; height: 160px; border: 1px solid #333; }
-        .race { background: #fff3e0; border-left: 4px solid #FF9800; }
-        .value { font-size: 24px; font-weight: bold; margin: 10px 0; }
-        button { background: #2196F3; color: white; border: none; padding: 15px 30px; font-size: 18px; border-radius: 5px; cursor: pointer; width: 100%; margin: 10px 0; }
-        button:hover { background: #1976D2; }
-        .btn-race { background: #FF9800; }
-        .btn-race:hover { background: #F57C00; }
-        .btn-reset { background: #FFC107; color: #333; }
-        .btn-reset:hover { background: #FFA000; }
-        .btn-start { background: #4CAF50; }
-        .btn-start:hover { background: #388E3C; }
-        .btn-stop { background: #757575; }
-        .btn-stop:hover { background: #424242; }
+        .chart-box { background: #1a1a2e; border-left: 4px solid #00d4ff; }
+        .chart-box h3 { color: #ccc; margin: 0 0 8px 0; }
+        .chart-box canvas { display: block; max-width: 100%; }
+        button { color: white; border: none; padding: 15px 30px; font-size: 18px; border-radius: 5px; cursor: pointer; width: 100%; margin: 10px 0; }
+        .btn-display { background: #2196F3; }
+        .btn-display:hover { background: #1976D2; }
+        .btn-ready { background: #4CAF50; }
+        .btn-ready:hover { background: #388E3C; }
+        .btn-racing { background: #FF9800; }
+        .btn-racing:hover { background: #F57C00; }
+        .btn-over { background: #9C27B0; }
+        .btn-over:hover { background: #7B1FA2; }
         .btn-reboot { background: #f44336; }
         .btn-reboot:hover { background: #c62828; }
         .loading { color: #666; font-style: italic; }
@@ -393,62 +396,92 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
 </head>
 <body>
     <div class="container">
-        <h1>Racer Status</h1>
-        <div class="status orientation">
-            <h3>Orientation</h3>
-            <div class="value" id="orientation">--</div>
-        </div>
-        <div class="status accel">
-            <h3>Accelerometer</h3>
-            <div>X: <span class="value" id="accel-x">--</span></div>
-            <div>Y: <span class="value" id="accel-y">--</span></div>
-            <div>Z: <span class="value" id="accel-z">--</span></div>
-        </div>
-        <div class="status effect">
-            <h3>LED Effect</h3>
-            <div class="value" id="effect">--</div>
-        </div>
+        <h1>Racer</h1>
         <div class="status lcd">
-            <h3>LCD Display</h3>
+            <div class="lcd-header">
+                <h3>LCD Display</h3>
+                <span class="mode-tag" id="mode">--</span>
+            </div>
             <canvas id="lcd" width="72" height="40"></canvas>
         </div>
-        <div class="status race">
-            <h3>Race</h3>
-            <div>State: <span class="value" id="race-state">--</span></div>
-            <div>Time: <span class="value" id="race-time">--</span></div>
+        <div class="status chart-box">
+            <h3>X Acceleration</h3>
+            <canvas id="accel-chart" width="520" height="110"></canvas>
         </div>
-        <button class="btn-start" onclick="startEffects()">Start Effects</button>
-        <button class="btn-stop" onclick="stopEffects()">Stop Effects</button>
-        <button onclick="cycleEffect()">Change LED Effect</button>
-        <button class="btn-race" onclick="startRace()">Start Race</button>
-        <button class="btn-reset" onclick="resetRace()">Reset Race</button>
+        <button class="btn-display" onclick="setMode('mode_display')">Display Mode</button>
+        <button class="btn-ready" onclick="setMode('mode_ready')">Race Ready</button>
+        <button class="btn-racing" onclick="setMode('mode_racing')">Racing</button>
+        <button class="btn-over" onclick="setMode('mode_over')">Race Over</button>
         <button class="btn-reboot" onclick="reboot()">Reboot Device</button>
         <div class="loading" id="status">Connecting...</div>
     </div>
     <script>
-        const orientationEl = document.getElementById('orientation');
-        const xEl = document.getElementById('accel-x');
-        const yEl = document.getElementById('accel-y');
-        const zEl = document.getElementById('accel-z');
-        const effectEl = document.getElementById('effect');
-        const raceStateEl = document.getElementById('race-state');
-        const raceTimeEl = document.getElementById('race-time');
+        const modeEl = document.getElementById('mode');
         const statusEl = document.getElementById('status');
-        function formatTime(ms) {
-            const s = Math.floor(ms / 1000);
-            const frac = String(ms % 1000).padStart(3, '0');
-            return s + '.' + frac + 's';
+
+        const accelBuf = [];
+        const CHART_LEN = 150;
+        const chartCanvas = document.getElementById('accel-chart');
+        const chartCtx = chartCanvas.getContext('2d');
+
+        function drawChart() {
+            const w = chartCanvas.width, h = chartCanvas.height;
+            const yMin = -20000, yMax = 20000;
+            function toY(v) { return h * (1 - (v - yMin) / (yMax - yMin)); }
+
+            chartCtx.fillStyle = '#0d0d1a';
+            chartCtx.fillRect(0, 0, w, h);
+
+            // Grid lines at ±2g, ±1g, 0
+            [[16384, '#2a2a3e', '+2g'], [8192, '#1e1e30', '+1g'],
+             [0, '#444', ' 0g'], [-8192, '#1e1e30', '-1g'], [-16384, '#2a2a3e', '-2g']
+            ].forEach(function(row) {
+                var v = row[0], color = row[1], label = row[2];
+                chartCtx.strokeStyle = color;
+                chartCtx.lineWidth = 1;
+                chartCtx.beginPath();
+                chartCtx.moveTo(0, toY(v));
+                chartCtx.lineTo(w, toY(v));
+                chartCtx.stroke();
+                chartCtx.fillStyle = '#666';
+                chartCtx.font = '10px monospace';
+                chartCtx.textAlign = 'right';
+                chartCtx.fillText(label, w - 4, toY(v) - 2);
+            });
+
+            // Race-start threshold marker
+            chartCtx.strokeStyle = '#2a5c2a';
+            chartCtx.lineWidth = 1;
+            chartCtx.setLineDash([4, 4]);
+            chartCtx.beginPath();
+            chartCtx.moveTo(0, toY(1500));
+            chartCtx.lineTo(w, toY(1500));
+            chartCtx.stroke();
+            chartCtx.setLineDash([]);
+            chartCtx.fillStyle = '#2a8a2a';
+            chartCtx.textAlign = 'left';
+            chartCtx.fillText('start', 4, toY(1500) - 2);
+
+            if (accelBuf.length < 2) return;
+            chartCtx.strokeStyle = '#00d4ff';
+            chartCtx.lineWidth = 1.5;
+            chartCtx.beginPath();
+            for (var i = 0; i < accelBuf.length; i++) {
+                var x = (CHART_LEN - accelBuf.length + i) / CHART_LEN * w;
+                var y = toY(accelBuf[i]);
+                if (i === 0) chartCtx.moveTo(x, y); else chartCtx.lineTo(x, y);
+            }
+            chartCtx.stroke();
         }
+
         function updateData(data) {
-            orientationEl.textContent = data.orientation;
-            xEl.textContent = data.accel.x;
-            yEl.textContent = data.accel.y;
-            zEl.textContent = data.accel.z;
-            effectEl.textContent = data.effect;
-            if (data.race !== undefined) raceStateEl.textContent = data.race;
-            if (data.elapsed !== undefined) raceTimeEl.textContent = data.race !== 'Idle' ? formatTime(data.elapsed) : '--';
+            if (data.mode !== undefined) modeEl.textContent = data.mode;
+            accelBuf.push(data.accel.x);
+            if (accelBuf.length > CHART_LEN) accelBuf.shift();
+            drawChart();
             statusEl.textContent = 'Last updated: ' + new Date().toLocaleTimeString();
         }
+
         const ws = new WebSocket('ws://' + window.location.host + '/ws');
         ws.onopen = () => { statusEl.textContent = 'Connected via WebSocket'; };
         ws.onmessage = (event) => {
@@ -457,6 +490,7 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
         };
         ws.onclose = () => { statusEl.textContent = 'WebSocket disconnected'; };
         ws.onerror = () => { statusEl.textContent = 'WebSocket error'; };
+
         const lcdCanvas = document.getElementById('lcd');
         const lcdCtx = lcdCanvas.getContext('2d');
         function drawLcd(hex) {
@@ -474,34 +508,11 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
             }
             lcdCtx.putImageData(img, 0, 0);
         }
-        function cycleEffect() {
+
+        function setMode(cmd) {
             if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send('cycle_effect');
-                statusEl.textContent = 'Effect change sent!';
-            } else { statusEl.textContent = 'WebSocket not connected'; }
-        }
-        function startEffects() {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send('start_effects');
-                statusEl.textContent = 'Effects started!';
-            } else { statusEl.textContent = 'WebSocket not connected'; }
-        }
-        function stopEffects() {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send('stop_effects');
-                statusEl.textContent = 'Effects stopped!';
-            } else { statusEl.textContent = 'WebSocket not connected'; }
-        }
-        function startRace() {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send('start_race');
-                statusEl.textContent = 'Race start sent!';
-            } else { statusEl.textContent = 'WebSocket not connected'; }
-        }
-        function resetRace() {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send('reset_race');
-                statusEl.textContent = 'Race reset!';
+                ws.send(cmd);
+                statusEl.textContent = 'Sent: ' + cmd;
             } else { statusEl.textContent = 'WebSocket not connected'; }
         }
         function reboot() {
@@ -514,10 +525,10 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
 </body>
 </html>"#;
 
-fn build_status_json(effect: Effect, orientation: Axis, accel: Accel, race: RaceState, elapsed_ms: u64) -> String<1024> {
+fn build_status_json(mode: RaceMode, orientation: Axis, accel: Accel, elapsed_ms: u64) -> String<1024> {
     let mut json = String::<1024>::new();
-    json.push_str(r#"{"effect":""#).unwrap();
-    json.push_str(effect.as_str()).unwrap();
+    json.push_str(r#"{"mode":""#).unwrap();
+    json.push_str(mode.as_str()).unwrap();
     json.push_str(r#"","orientation":""#).unwrap();
     json.push_str(orientation.as_str()).unwrap();
     json.push_str(r#"","accel":{"x":"#).unwrap();
@@ -539,8 +550,6 @@ fn build_status_json(effect: Effect, orientation: Axis, accel: Accel, race: Race
         json.push(HEX[(byte >> 4) as usize] as char).unwrap();
         json.push(HEX[(byte & 0x0F) as usize] as char).unwrap();
     }
-    json.push_str(r#"","race":""#).unwrap();
-    json.push_str(race.as_str()).unwrap();
     json.push_str(r#"","elapsed":"#).unwrap();
     let mut elapsed_str = String::<16>::new();
     usize_to_str(elapsed_ms as usize, &mut elapsed_str);
@@ -582,8 +591,6 @@ impl Bmi160 {
     }
 }
 
-
-
 fn encode_ws2812(data: &[RGB8], pulses: &mut [PulseCode]) {
     const T0H: u16 = 28;
     const T0L: u16 = 55;
@@ -603,13 +610,11 @@ fn encode_ws2812(data: &[RGB8], pulses: &mut [PulseCode]) {
     }
 
     let mut index = 0;
-
     for led in data.iter() {
         encode_byte(led.g, pulses, &mut index);
         encode_byte(led.r, pulses, &mut index);
         encode_byte(led.b, pulses, &mut index);
     }
-
     pulses[index] = PulseCode::end_marker();
 }
 
@@ -670,6 +675,40 @@ impl DrawTarget for DisplayBuffer {
     }
 }
 
+// Draw a large "4" filling most of the 72×40 display.
+fn draw_number_four(buf: &mut DisplayBuffer) {
+    // Right vertical stroke: x=44..49, y=2..37 (6px wide, full height)
+    for y in 2i32..38 {
+        for x in 44i32..50 {
+            buf.set_pixel(x, y, BinaryColor::On);
+        }
+    }
+    // Left vertical stroke: x=22..27, y=2..25 (6px wide, stops at crossbar)
+    for y in 2i32..26 {
+        for x in 22i32..28 {
+            buf.set_pixel(x, y, BinaryColor::On);
+        }
+    }
+    // Horizontal crossbar: x=22..49, y=20..25 (full width, 6px tall)
+    for y in 20i32..26 {
+        for x in 22i32..50 {
+            buf.set_pixel(x, y, BinaryColor::On);
+        }
+    }
+}
+
+// Small plus-sign decorations at the four corners of the display.
+fn draw_display_decorations(buf: &mut DisplayBuffer) {
+    let corners: [(i32, i32); 4] = [(3, 3), (68, 3), (3, 36), (68, 36)];
+    for (cx, cy) in corners {
+        buf.set_pixel(cx,     cy,     BinaryColor::On);
+        buf.set_pixel(cx - 1, cy,     BinaryColor::On);
+        buf.set_pixel(cx + 1, cy,     BinaryColor::On);
+        buf.set_pixel(cx,     cy - 1, BinaryColor::On);
+        buf.set_pixel(cx,     cy + 1, BinaryColor::On);
+    }
+}
+
 fn initialize_display(i2c: &mut I2c<'_, esp_hal::Blocking>, delay: &mut Delay) {
     let init_commands: &[u8] = &[
         0xAE, 0xD5, 0x80, 0xA8, 0x27, 0xD3, 0x00, 0x40, 0x8D, 0x14, 0x20, 0x00,
@@ -691,8 +730,8 @@ fn flush_display(i2c: &mut I2c<'_, esp_hal::Blocking>, buffer: &DisplayBuffer) {
     for page in 0..DISPLAY_PAGES {
         let page_commands = [
             0xB0 | page as u8,
-            DISPLAY_COL_OFFSET & 0x0F,        // lower column nibble
-            0x10 | (DISPLAY_COL_OFFSET >> 4), // upper column nibble
+            DISPLAY_COL_OFFSET & 0x0F,
+            0x10 | (DISPLAY_COL_OFFSET >> 4),
         ];
         let mut cmd_packet = [0u8; 4];
         cmd_packet[0] = SSD1306_CMD;
@@ -720,8 +759,6 @@ async fn wifi_controller_task(mut controller: esp_radio::wifi::WifiController<'s
         match controller.connect_async().await {
             Ok(info) => {
                 println!("WiFi: Connected successfully! Info: {:?}", info);
-                
-                // Wait for disconnect event
                 let disconnect_info = controller.wait_for_disconnect_async().await.ok();
                 println!("WiFi: Disconnected: {:?}", disconnect_info);
             }
@@ -729,8 +766,6 @@ async fn wifi_controller_task(mut controller: esp_radio::wifi::WifiController<'s
                 println!("WiFi: Failed to connect: {:?}", e);
             }
         }
-        
-        // Retry connection after 5 seconds
         Timer::after(Duration::from_millis(5000)).await;
     }
 }
@@ -746,10 +781,7 @@ async fn web_server(stack: Stack<'static>) {
 
         println!("Web server: Waiting for connection...");
         let r = socket
-            .accept(IpListenEndpoint {
-                addr: None,
-                port: 80,
-            })
+            .accept(IpListenEndpoint { addr: None, port: 80 })
             .await;
         println!("Web server: Connection attempt result: {:?}", r.is_ok());
 
@@ -760,45 +792,33 @@ async fn web_server(stack: Stack<'static>) {
 
         println!("Web server: Client connected, processing request...");
 
-        // Read the HTTP request
         let mut request_data = heapless::Vec::<u8, 1024>::new();
-
-        // Read until we have a complete HTTP request
         let mut request_complete = false;
         loop {
             let mut temp_buf = [0u8; 256];
             match socket.read(&mut temp_buf).await {
-                Ok(0) => {
-                    println!("read EOF");
-                    break;
-                }
+                Ok(0) => { println!("read EOF"); break; }
                 Ok(len) => {
                     if request_data.extend_from_slice(&temp_buf[..len]).is_err() {
                         println!("Request too large");
                         break;
                     }
-                    
-                    // Check if we have a complete HTTP request (ends with \r\n\r\n)
-                    if request_data.len() >= 4 && 
+                    if request_data.len() >= 4 &&
                        request_data[request_data.len()-4..] == [b'\r', b'\n', b'\r', b'\n'] {
                         request_complete = true;
                         break;
                     }
                 }
-                Err(e) => {
-                    println!("read error: {:?}", e);
-                    break;
-                }
+                Err(e) => { println!("read error: {:?}", e); break; }
             }
         }
 
-        // Parse the request if we have complete data
         let mut headers = [EMPTY_HEADER; 16];
         let mut request = Request::new(&mut headers);
         let parse_result = if request_complete {
             request.parse(&request_data)
         } else {
-            Err(httparse::Error::TooManyHeaders) // Or some other error
+            Err(httparse::Error::TooManyHeaders)
         };
 
         if request_complete && matches!(parse_result, Ok(httparse::Status::Complete(_))) {
@@ -833,7 +853,6 @@ async fn web_server(stack: Stack<'static>) {
                     let mut rx_buf = [0u8; 64];
 
                     loop {
-                        // Race between incoming data from client and a 500ms tick
                         let timer = Timer::after(Duration::from_millis(500));
                         let read_fut = socket.read(&mut rx_buf);
 
@@ -847,12 +866,10 @@ async fn web_server(stack: Stack<'static>) {
                                     Ok(n) if n >= 2 => {
                                         let opcode = rx_buf[0] & 0x0F;
                                         if opcode == 8 {
-                                            // Close frame
                                             println!("WebSocket close frame received");
                                             break;
                                         }
                                         if opcode == 1 {
-                                            // Text frame - check for cycle_effect command
                                             let masked = (rx_buf[1] & 0x80) != 0;
                                             let payload_len = (rx_buf[1] & 0x7F) as usize;
                                             let payload_start = if masked { 6 } else { 2 };
@@ -866,24 +883,17 @@ async fn web_server(stack: Stack<'static>) {
                                                 } else {
                                                     decoded[..payload_len].copy_from_slice(&rx_buf[payload_start..payload_start + payload_len]);
                                                 }
-                                                if &decoded[..payload_len] == b"cycle_effect" {
-                                                    println!("WebSocket: cycle_effect command");
-                                                    cycle_effect();
+                                                if &decoded[..payload_len] == b"mode_display" {
+                                                    enter_mode(RaceMode::Display);
                                                 }
-                                                if &decoded[..payload_len] == b"start_race" {
-                                                    println!("WebSocket: start_race command");
-                                                    start_race();
+                                                if &decoded[..payload_len] == b"mode_ready" {
+                                                    enter_mode(RaceMode::RaceReady);
                                                 }
-                                                if &decoded[..payload_len] == b"start_effects" {
-                                                    set_effects_active(true);
-                                                    if current_effect() == Effect::Off { cycle_effect(); }
+                                                if &decoded[..payload_len] == b"mode_racing" {
+                                                    enter_mode(RaceMode::Racing);
                                                 }
-                                                if &decoded[..payload_len] == b"stop_effects" {
-                                                    set_effects_active(false);
-                                                    set_effect(Effect::Off);
-                                                }
-                                                if &decoded[..payload_len] == b"reset_race" {
-                                                    reset_race();
+                                                if &decoded[..payload_len] == b"mode_over" {
+                                                    enter_mode(RaceMode::RaceOver);
                                                 }
                                                 if &decoded[..payload_len] == b"reboot" {
                                                     esp_hal::system::software_reset();
@@ -897,16 +907,11 @@ async fn web_server(stack: Stack<'static>) {
                                         break;
                                     }
                                 }
-                                // After handling incoming data, send a status update immediately
                             }
-                            embassy_futures::select::Either::Second(_) => {
-                                // Timer fired - send status update
-                            }
+                            embassy_futures::select::Either::Second(_) => {}
                         }
 
-                        // Send status update
-                        let json = build_status_json(current_effect(), current_orientation(), current_accel(), race_state(), race_elapsed_ms());
-
+                        let json = build_status_json(current_mode(), current_orientation(), current_accel(), race_elapsed_ms());
                         let frame_len = encode_ws_text_frame(json.as_bytes(), &mut frame_buffer);
                         if let Err(e) = socket_write_all(&mut socket, &frame_buffer[..frame_len]).await {
                             println!("WebSocket stream write failed: {:?}", e);
@@ -918,10 +923,7 @@ async fn web_server(stack: Stack<'static>) {
                     continue;
                 }
 
-                // Serve the HTML page directly via two writes — the page is too large
-                // to fit in the String<4096> used for API responses.
-                let is_api = path == "/data" ||
-                    (path == "/effect" && request.method == Some("POST"));
+                let is_api = path == "/data";
                 if !is_api {
                     let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n";
                     socket_write_all(&mut socket, header).await.ok();
@@ -933,36 +935,19 @@ async fn web_server(stack: Stack<'static>) {
             }
         }
 
-        // Process the request
         let response: String<4096> = if request_complete && matches!(parse_result, Ok(httparse::Status::Complete(_))) {
             if let Some(path) = request.path {
                 match path {
                     "/data" => {
-                        let json = build_status_json(current_effect(), current_orientation(), current_accel(), race_state(), race_elapsed_ms());
+                        let json = build_status_json(current_mode(), current_orientation(), current_accel(), race_elapsed_ms());
                         let content_length = json.len();
                         let mut response = String::<4096>::new();
                         response.push_str("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ").unwrap();
-                        
                         let mut cl_str = String::<16>::new();
                         usize_to_str(content_length, &mut cl_str);
                         response.push_str(cl_str.as_str()).unwrap();
                         response.push_str("\r\n\r\n").unwrap();
                         response.push_str(json.as_str()).unwrap();
-                        response
-                    }
-                    "/effect" if request.method == Some("POST") => {
-                        cycle_effect();
-                        
-                        let json = r#"{"status":"ok"}"#;
-                        let content_length = json.len();
-                        let mut response = String::<4096>::new();
-                        response.push_str("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ").unwrap();
-                        
-                        let mut cl_str = String::<16>::new();
-                        usize_to_str(content_length, &mut cl_str);
-                        response.push_str(cl_str.as_str()).unwrap();
-                        response.push_str("\r\n\r\n").unwrap();
-                        response.push_str(json).unwrap();
                         response
                     }
                     _ => {
@@ -972,13 +957,11 @@ async fn web_server(stack: Stack<'static>) {
                     }
                 }
             } else {
-                // Invalid request - no path
                 let mut response = String::<4096>::new();
                 response.push_str("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n").unwrap();
                 response
             }
         } else {
-            // Invalid request - parsing failed
             let mut response = String::<4096>::new();
             response.push_str("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n").unwrap();
             response
@@ -989,7 +972,7 @@ async fn web_server(stack: Stack<'static>) {
         } else {
             println!("Flush completed successfully");
         }
-        
+
         socket.close();
         Timer::after(Duration::from_millis(100)).await;
     }
@@ -1038,7 +1021,7 @@ async fn main(spawner: Spawner) -> ! {
     println!("WiFi controller created successfully");
 
     let wifi_interface = interfaces.station;
-    
+
     println!("Spawning WiFi controller task...");
     spawner.spawn(wifi_controller_task(controller).unwrap());
     println!("WiFi controller task spawned");
@@ -1049,7 +1032,6 @@ async fn main(spawner: Spawner) -> ! {
     let rng = Rng::new();
     let seed = (rng.random() as u64) << 32 | rng.random() as u64;
 
-    // Init network stack
     let (stack, runner) = embassy_net::new(
         wifi_interface,
         config,
@@ -1061,14 +1043,11 @@ async fn main(spawner: Spawner) -> ! {
     );
     println!("Network stack initialized");
 
-    // Spawn network task
     println!("Spawning network task...");
     spawner.spawn(net_task(runner).unwrap());
     println!("Network task spawned");
 
-    // Wait for DHCP with timeout
     println!("Waiting for DHCP configuration...");
-    
     let mut ip_address = None;
     let dhcp_timeout = async {
         let start = embassy_time::Instant::now();
@@ -1079,34 +1058,25 @@ async fn main(spawner: Spawner) -> ! {
                 ip_address = Some(config.address);
                 break;
             }
-            
-            // Print status every 5 seconds
             if last_report.elapsed() > Duration::from_secs(5) {
-                println!("DHCP waiting... Link up: {}, Elapsed: {}s", 
-                    stack.is_link_up(), 
+                println!("DHCP waiting... Link up: {}, Elapsed: {}s",
+                    stack.is_link_up(),
                     start.elapsed().as_secs());
                 last_report = embassy_time::Instant::now();
             }
-            
             if start.elapsed() > Duration::from_secs(30) {
-                println!("DHCP timeout! No IP address received after 30 seconds");
-                println!("Final network stack link up: {}", stack.is_link_up());
-                println!("Stack resources check: attempting to query stack state");
+                println!("DHCP timeout after 30 seconds");
                 break;
             }
-            
             Timer::after(Duration::from_millis(500)).await;
         }
     };
-    
     dhcp_timeout.await;
 
-    // Spawn web server task
     println!("Starting web server on port 80...");
     spawner.spawn(web_server(stack).unwrap());
     println!("Web server started");
 
-    // Initialize hardware
     println!("Initializing hardware peripherals...");
     let mut delay = Delay::new();
 
@@ -1131,6 +1101,11 @@ async fn main(spawner: Spawner) -> ! {
         .text_color(BinaryColor::On)
         .build();
 
+    let small_style = MonoTextStyleBuilder::new()
+        .font(&FONT_6X10)
+        .text_color(BinaryColor::On)
+        .build();
+
     println!("Setting up RMT for LED control...");
     let rmt = esp_hal::rmt::Rmt::new(peripherals.RMT, esp_hal::time::Rate::from_mhz(80)).unwrap();
     let tx_config = TxChannelConfig::default()
@@ -1148,14 +1123,10 @@ async fn main(spawner: Spawner) -> ! {
 
     let mut pulses = [PulseCode::default(); TOTAL_LEDS * 24 + 1];
 
-
-
-    // --- Button for effect cycling (GPIO10, pull-up) ---
     use esp_hal::gpio::{Input, InputConfig, Pull};
     let button_config = InputConfig::default().with_pull(Pull::Up);
     let button = Input::new(peripherals.GPIO10, button_config);
     let mut last_button_state = false;
-    // Cooldown in loop iterations (5 × 80ms = 400ms) to debounce the button.
     let mut button_cooldown: u8 = 0;
 
     println!("All initialization complete! Starting main loop...");
@@ -1172,45 +1143,72 @@ async fn main(spawner: Spawner) -> ! {
         let axis = accel_data.dominant_axis();
         set_orientation(axis);
 
-        match race_state() {
-            RaceState::Idle => {
+        match current_mode() {
+            RaceMode::RaceReady => {
                 if accel_data.x > RACE_START_THRESHOLD {
-                    start_race();
+                    enter_mode(RaceMode::Racing);
                 }
             }
-            RaceState::Racing => {
+            RaceMode::Racing => {
                 let elapsed = embassy_time::Instant::now().as_millis() - race_start_ms();
                 set_race_elapsed_ms(elapsed);
                 let delta = (accel_data.x as i32) - (prev_x as i32);
                 if delta < RACE_END_THRESHOLD {
-                    set_race_state(RaceState::Finished);
+                    enter_mode(RaceMode::RaceOver);
                 }
             }
-            RaceState::Finished => {}
+            _ => {}
         }
         prev_x = accel_data.x;
         set_accel(accel_data);
 
         display_buffer.clear();
-        let mut time_str = String::<16>::new();
-        format_race_time(race_elapsed_ms(), &mut time_str);
-        Text::new(time_str.as_str(), Point::new(1, 30), text_style)
-            .draw(&mut display_buffer)
-            .unwrap();
+        match current_mode() {
+            RaceMode::Display => {
+                draw_number_four(&mut display_buffer);
+                draw_display_decorations(&mut display_buffer);
+            }
+            RaceMode::RaceReady => {
+                // "READY": 5 chars × 10px = 50px wide, centred on 72px display.
+                // y=26: FONT_10X20 baseline is ~16px from top, so glyph top lands at y=10.
+                Text::new("READY", Point::new(11, 26), text_style)
+                    .draw(&mut display_buffer)
+                    .unwrap();
+            }
+            RaceMode::Racing => {
+                let mut time_str = String::<16>::new();
+                format_race_time(race_elapsed_ms(), &mut time_str);
+                let x_pos = (72usize.saturating_sub(time_str.len() * 10) / 2) as i32;
+                // y=26: glyph top at y=10, vertically centred in 40px display.
+                Text::new(time_str.as_str(), Point::new(x_pos, 26), text_style)
+                    .draw(&mut display_buffer)
+                    .unwrap();
+            }
+            RaceMode::RaceOver => {
+                // Two-line layout: RACE OVER (10px) + 2px gap + time (20px) = 32px total,
+                // centred in 40px → top margin 4px.
+                // FONT_6X10 baseline ~7px: y = 4+7 = 11. FONT_10X20 baseline ~16px: y = 16+16 = 32.
+                Text::new("RACE OVER", Point::new(9, 11), small_style)
+                    .draw(&mut display_buffer)
+                    .unwrap();
+                let mut time_str = String::<16>::new();
+                format_race_time(race_elapsed_ms(), &mut time_str);
+                let x_pos = (72usize.saturating_sub(time_str.len() * 10) / 2) as i32;
+                Text::new(time_str.as_str(), Point::new(x_pos, 32), text_style)
+                    .draw(&mut display_buffer)
+                    .unwrap();
+            }
+        }
         flush_display(&mut i2c, &display_buffer);
         set_display(&display_buffer.buffer);
 
-        let tick = if effects_active() || race_state() == RaceState::Racing {
-            (embassy_time::Instant::now().as_millis() as usize) / 80
-        } else {
-            0
-        };
+        let tick = (embassy_time::Instant::now().as_millis() as usize) / 80;
         let mut colors = [RGB8::new(0, 0, 0); TOTAL_LEDS];
-        update_leds(&mut colors, current_effect(), tick);
+        update_leds(&mut colors, mode_effect(current_mode()), tick);
         for c in colors.iter_mut() {
-            c.r /= 8;
-            c.g /= 8;
-            c.b /= 8;
+            c.r /= 12;
+            c.g /= 12;
+            c.b /= 12;
         }
 
         encode_ws2812(&colors, &mut pulses);
@@ -1219,12 +1217,8 @@ async fn main(spawner: Spawner) -> ! {
 
         let reading = button.is_low();
         if reading && !last_button_state && button_cooldown == 0 {
-            println!("Button pressed!");
-            if race_state() == RaceState::Idle {
-                cycle_effect();
-            } else {
-                reset_race();
-            }
+            println!("Button pressed: cycling mode");
+            cycle_mode();
             button_cooldown = 5;
         }
         last_button_state = reading;

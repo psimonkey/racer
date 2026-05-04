@@ -30,6 +30,9 @@ pub enum Effect {
     RainbowSections,
     WaveChase,
     AlternatingGlow,
+    PulsingGreen,
+    RacingChase,
+    Fireworks,
 }
 
 impl fmt::Display for Effect {
@@ -39,8 +42,8 @@ impl fmt::Display for Effect {
 }
 
 impl Effect {
-    pub const fn all() -> [Effect; 6] {
-        [Effect::Off, Effect::BlueRedChase, Effect::RainbowTravel, Effect::RainbowSections, Effect::WaveChase, Effect::AlternatingGlow]
+    pub const fn all() -> [Effect; 9] {
+        [Effect::Off, Effect::BlueRedChase, Effect::RainbowTravel, Effect::RainbowSections, Effect::WaveChase, Effect::AlternatingGlow, Effect::PulsingGreen, Effect::RacingChase, Effect::Fireworks]
     }
 
     pub fn index(self) -> usize {
@@ -55,6 +58,9 @@ impl Effect {
             Effect::RainbowSections => "Rainbow Sections",
             Effect::WaveChase => "Wave Chase",
             Effect::AlternatingGlow => "Alternating Glow",
+            Effect::PulsingGreen => "Pulsing Green",
+            Effect::RacingChase => "Racing Chase",
+            Effect::Fireworks => "Fireworks",
         }
     }
 }
@@ -124,13 +130,42 @@ pub fn update_leds(data: &mut [RGB8; TOTAL_LEDS], effect: Effect, time: usize) {
                     1 => RGB8::default(),
                     _ => {
                         let color = RAINBOW[(time / 8 + 3) % RAINBOW.len()];
-                        // Dim the middle LEDs
                         RGB8 {
                             r: color.r / 3,
                             g: color.g / 3,
                             b: color.b / 3,
                         }
                     }
+                }
+            }
+            Effect::PulsingGreen => {
+                // Slow triangle-wave pulse, ~3 second period (38 ticks at 80ms)
+                let period = 38usize;
+                let phase = time % period;
+                let brightness = if phase < period / 2 {
+                    (phase * 510 / period) as u8
+                } else {
+                    ((period - phase) * 510 / period) as u8
+                };
+                RGB8 { r: 0, g: brightness, b: 0 }
+            }
+            Effect::RacingChase => {
+                // Fast rainbow sweep, 15× speed of RainbowTravel
+                let hue = ((local * 360 / NUM_LEDS) + time * 90) % 360;
+                hsv_to_rgb(hue as u16, 255)
+            }
+            Effect::Fireworks => {
+                // Celebration: full rainbow across all LEDs with random white sparkles
+                let base_hue = ((local * 360 / NUM_LEDS) + time * 3) % 360;
+                let base_color = hsv_to_rgb(base_hue as u16, 220);
+                // Sparkle lasts ~3 ticks (~240ms) for a smooth flash feel
+                let sparkle_tick = time / 3;
+                let hash = local.wrapping_mul(2654435761usize)
+                    ^ sparkle_tick.wrapping_mul(2246822519usize);
+                if hash & 0xFF < 40 {
+                    RGB8 { r: 255, g: 255, b: 255 }
+                } else {
+                    base_color
                 }
             }
         };
