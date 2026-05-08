@@ -105,7 +105,7 @@ fn mode_effect(mode: RaceMode) -> Effect {
         RaceMode::Display   => Effect::WaveChase,
         RaceMode::RaceReady => Effect::PulsingGreen,
         RaceMode::Racing    => Effect::RacingChase,
-        RaceMode::RaceOver  => Effect::Fireworks,
+        RaceMode::RaceOver  => Effect::CheckerPulse,
     }
 }
 
@@ -115,6 +115,7 @@ static mut CURRENT_ACCEL: Accel = Accel { x: 0, y: 0, z: 0 };
 static mut CURRENT_DISPLAY: [u8; DISPLAY_WIDTH * DISPLAY_PAGES] = [0; DISPLAY_WIDTH * DISPLAY_PAGES];
 static mut RACE_START_MS: u64 = 0;
 static mut RACE_ELAPSED_MS: u64 = 0;
+static mut BEST_RACE_MS: u64 = 0;       // best (shortest) race time seen this session; 0 = none
 static mut X_INCLINE_BASELINE: i32 = 0; // X reading while stationary on incline
 static mut VELOCITY_EST: i32 = 0;       // Σ(accel_x - baseline), proxy for motion onset
 static mut READY_TICKS: u16 = 0;        // ticks spent in RaceReady settling/detecting
@@ -134,6 +135,19 @@ fn enter_mode(mode: RaceMode) {
             RACE_START_MS = embassy_time::Instant::now().as_millis();
             RACE_ELAPSED_MS = 0;
             RACE_TICKS = 0;
+        },
+        RaceMode::RaceOver => {
+            // Snapshot the finish time at the exact moment of detection (not end of tick).
+            // Only meaningful when coming from Racing; manual mode switches keep the last value.
+            if current_mode() == RaceMode::Racing {
+                let elapsed = embassy_time::Instant::now().as_millis() - race_start_ms();
+                set_race_elapsed_ms(elapsed);
+                unsafe {
+                    if elapsed > 0 && (BEST_RACE_MS == 0 || elapsed < BEST_RACE_MS) {
+                        BEST_RACE_MS = elapsed;
+                    }
+                }
+            }
         },
         _ => {}
     }
@@ -156,6 +170,7 @@ fn current_display() -> [u8; DISPLAY_WIDTH * DISPLAY_PAGES] { unsafe { CURRENT_D
 fn set_display(buf: &[u8; DISPLAY_WIDTH * DISPLAY_PAGES]) { unsafe { CURRENT_DISPLAY = *buf; } }
 fn race_elapsed_ms() -> u64 { unsafe { RACE_ELAPSED_MS } }
 fn set_race_elapsed_ms(ms: u64) { unsafe { RACE_ELAPSED_MS = ms; } }
+fn best_race_ms() -> u64 { unsafe { BEST_RACE_MS } }
 fn race_start_ms() -> u64 { unsafe { RACE_START_MS } }
 fn x_incline_baseline() -> i32 { unsafe { X_INCLINE_BASELINE } }
 fn set_x_incline_baseline(v: i32) { unsafe { X_INCLINE_BASELINE = v; } }
@@ -423,6 +438,7 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
         .btn-reboot { background: #f44336; }
         .btn-reboot:hover { background: #c62828; }
         .loading { color: #666; font-style: italic; }
+        .best-time { color: #00d4ff; text-align: center; font-size: 22px; font-weight: bold; padding: 6px 0 2px; letter-spacing: 1px; }
     </style>
 </head>
 <body>
@@ -434,6 +450,7 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
                 <span class="mode-tag" id="mode">--</span>
             </div>
             <canvas id="lcd" width="72" height="40"></canvas>
+            <div class="best-time" id="best-time">Best: --</div>
         </div>
         <div class="status chart-box">
             <h3>X Acceleration</h3>
@@ -449,8 +466,17 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
     <script>
         const modeEl = document.getElementById('mode');
         const statusEl = document.getElementById('status');
+        const bestEl = document.getElementById('best-time');
+
+        function formatTime(ms) {
+            var s = Math.floor(ms / 1000);
+            var m = ms % 1000;
+            return (s < 10 ? '0' : '') + s + '.' +
+                   (m < 100 ? '0' : '') + (m < 10 ? '0' : '') + m;
+        }
 
         const accelBuf = [];
+        const modeBuf = [];
         const CHART_LEN = 150;
         const chartCanvas = document.getElementById('accel-chart');
         const chartCtx = chartCanvas.getContext('2d');
@@ -462,6 +488,20 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
 
             chartCtx.fillStyle = '#0d0d1a';
             chartCtx.fillRect(0, 0, w, h);
+
+            // Shade regions where mode was Racing
+            chartCtx.fillStyle = 'rgba(255, 152, 0, 0.15)';
+            var inRacing = false, regionStart = 0;
+            for (var i = 0; i <= modeBuf.length; i++) {
+                var racing = i < modeBuf.length && modeBuf[i] === 'Racing';
+                if (racing && !inRacing) {
+                    regionStart = (CHART_LEN - modeBuf.length + i) / CHART_LEN * w;
+                    inRacing = true;
+                } else if (!racing && inRacing) {
+                    chartCtx.fillRect(regionStart, 0, (CHART_LEN - modeBuf.length + i) / CHART_LEN * w - regionStart, h);
+                    inRacing = false;
+                }
+            }
 
             // Grid lines at ±2g, ±1g, 0
             [[16384, '#2a2a3e', '+2g'], [8192, '#1e1e30', '+1g'],
@@ -507,8 +547,11 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
 
         function updateData(data) {
             if (data.mode !== undefined) modeEl.textContent = data.mode;
+            if (data.best && data.best > 0) bestEl.textContent = 'Best: ' + formatTime(data.best);
             accelBuf.push(data.accel.x);
             if (accelBuf.length > CHART_LEN) accelBuf.shift();
+            modeBuf.push(data.mode);
+            if (modeBuf.length > CHART_LEN) modeBuf.shift();
             drawChart();
             statusEl.textContent = 'Last updated: ' + new Date().toLocaleTimeString();
         }
@@ -585,6 +628,10 @@ fn build_status_json(mode: RaceMode, orientation: Axis, accel: Accel, elapsed_ms
     let mut elapsed_str = String::<16>::new();
     usize_to_str(elapsed_ms as usize, &mut elapsed_str);
     json.push_str(elapsed_str.as_str()).unwrap();
+    json.push_str(r#","best":"#).unwrap();
+    let mut best_str = String::<16>::new();
+    usize_to_str(best_race_ms() as usize, &mut best_str);
+    json.push_str(best_str.as_str()).unwrap();
     json.push('}').unwrap();
     json
 }
@@ -1221,11 +1268,21 @@ async fn main(spawner: Spawner) -> ! {
                 draw_display_decorations(&mut display_buffer);
             }
             RaceMode::RaceReady => {
-                // "READY": 5 chars × 10px = 50px wide, centred on 72px display.
-                // y=26: FONT_10X20 baseline is ~16px from top, so glyph top lands at y=10.
-                Text::new("READY", Point::new(11, 26), text_style)
-                    .draw(&mut display_buffer)
-                    .unwrap();
+                let rt = ready_ticks();
+                if rt < READY_DELAY_TICKS {
+                    // Countdown 3→2→1 across the 3-second baseline delay.
+                    let segment = rt * 3 / READY_DELAY_TICKS; // 0, 1, or 2
+                    let digit = match segment { 0 => "3", 1 => "2", _ => "1" };
+                    // Single digit (10px wide), centred on 72px display at x=31.
+                    Text::new(digit, Point::new(31, 26), text_style)
+                        .draw(&mut display_buffer)
+                        .unwrap();
+                } else {
+                    // Detection phase: show "READY" (5 chars × 10px = 50px, centred).
+                    Text::new("READY", Point::new(11, 26), text_style)
+                        .draw(&mut display_buffer)
+                        .unwrap();
+                }
             }
             RaceMode::Racing => {
                 let mut time_str = String::<16>::new();
@@ -1256,7 +1313,12 @@ async fn main(spawner: Spawner) -> ! {
 
         let tick = (embassy_time::Instant::now().as_millis() as usize) / 80;
         let mut colors = [RGB8::new(0, 0, 0); TOTAL_LEDS];
-        update_leds(&mut colors, mode_effect(current_mode()), tick);
+        let led_effect = if current_mode() == RaceMode::RaceReady && ready_ticks() >= READY_DELAY_TICKS {
+            Effect::SolidGreen
+        } else {
+            mode_effect(current_mode())
+        };
+        update_leds(&mut colors, led_effect, tick);
         for c in colors.iter_mut() {
             c.r /= 12;
             c.g /= 12;

@@ -31,8 +31,10 @@ pub enum Effect {
     WaveChase,
     AlternatingGlow,
     PulsingGreen,
+    SolidGreen,
     RacingChase,
     Fireworks,
+    CheckerPulse,
 }
 
 impl fmt::Display for Effect {
@@ -42,8 +44,8 @@ impl fmt::Display for Effect {
 }
 
 impl Effect {
-    pub const fn all() -> [Effect; 9] {
-        [Effect::Off, Effect::BlueRedChase, Effect::RainbowTravel, Effect::RainbowSections, Effect::WaveChase, Effect::AlternatingGlow, Effect::PulsingGreen, Effect::RacingChase, Effect::Fireworks]
+    pub const fn all() -> [Effect; 11] {
+        [Effect::Off, Effect::BlueRedChase, Effect::RainbowTravel, Effect::RainbowSections, Effect::WaveChase, Effect::AlternatingGlow, Effect::PulsingGreen, Effect::SolidGreen, Effect::RacingChase, Effect::Fireworks, Effect::CheckerPulse]
     }
 
     pub fn index(self) -> usize {
@@ -59,8 +61,10 @@ impl Effect {
             Effect::WaveChase => "Wave Chase",
             Effect::AlternatingGlow => "Alternating Glow",
             Effect::PulsingGreen => "Pulsing Green",
+            Effect::SolidGreen => "Solid Green",
             Effect::RacingChase => "Racing Chase",
             Effect::Fireworks => "Fireworks",
+            Effect::CheckerPulse => "Checker Pulse",
         }
     }
 }
@@ -149,6 +153,7 @@ pub fn update_leds(data: &mut [RGB8; TOTAL_LEDS], effect: Effect, time: usize) {
                 };
                 RGB8 { r: 0, g: brightness, b: 0 }
             }
+            Effect::SolidGreen => RGB8 { r: 0, g: 255, b: 0 },
             Effect::RacingChase => {
                 // Fast rainbow sweep, 15× speed of RainbowTravel
                 let hue = ((local * 360 / NUM_LEDS) + time * 90) % 360;
@@ -167,6 +172,19 @@ pub fn update_leds(data: &mut [RGB8; TOTAL_LEDS], effect: Effect, time: usize) {
                 } else {
                     base_color
                 }
+            }
+            Effect::CheckerPulse => {
+                // Alternating white LEDs pulse in antiphase: even positions fade in while
+                // odd positions fade out, then swap — ~1.6 s per full cycle at 80 ms ticks.
+                let period = 10usize;
+                let phase = time % period;
+                let brightness = if phase < period / 2 {
+                    (phase * 510 / period) as u8
+                } else {
+                    ((period - phase) * 510 / period) as u8
+                };
+                let v = if local % 2 == 0 { brightness } else { 255 - brightness };
+                RGB8 { r: v, g: v, b: v }
             }
         };
     }
