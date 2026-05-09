@@ -87,14 +87,15 @@ const IMPACT_DELTA: i32 = 5000;        // |delta LSB| over 20ms indicating end-s
 const REBOOT_HOLD_TICKS: u8 = 63;      // 63 × 80ms ≈ 5 s button hold to reboot
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum RaceMode { Display, RaceReady, Racing, RaceOver }
+enum RaceMode { Standby, Display, RaceReady, Racing, RaceOver }
 
 impl RaceMode {
     fn as_str(self) -> &'static str {
         match self {
-            RaceMode::Display => "Display",
+            RaceMode::Standby  => "Standby",
+            RaceMode::Display  => "Display",
             RaceMode::RaceReady => "Race Ready",
-            RaceMode::Racing => "Racing",
+            RaceMode::Racing   => "Racing",
             RaceMode::RaceOver => "Race Over",
         }
     }
@@ -102,6 +103,7 @@ impl RaceMode {
 
 fn mode_effect(mode: RaceMode) -> Effect {
     match mode {
+        RaceMode::Standby   => Effect::Standby,
         RaceMode::Display   => Effect::WaveChase,
         RaceMode::RaceReady => Effect::PulsingGreen,
         RaceMode::Racing    => Effect::RacingChase,
@@ -109,7 +111,7 @@ fn mode_effect(mode: RaceMode) -> Effect {
     }
 }
 
-static mut CURRENT_MODE: RaceMode = RaceMode::Display;
+static mut CURRENT_MODE: RaceMode = RaceMode::Standby;
 static mut CURRENT_ORIENTATION: Axis = Axis::X;
 static mut CURRENT_ACCEL: Accel = Accel { x: 0, y: 0, z: 0 };
 static mut CURRENT_DISPLAY: [u8; DISPLAY_WIDTH * DISPLAY_PAGES] = [0; DISPLAY_WIDTH * DISPLAY_PAGES];
@@ -155,10 +157,11 @@ fn enter_mode(mode: RaceMode) {
 }
 fn cycle_mode() {
     let next = match current_mode() {
+        RaceMode::Standby   => RaceMode::Display,
         RaceMode::Display   => RaceMode::RaceReady,
         RaceMode::RaceReady => RaceMode::Racing,
         RaceMode::Racing    => RaceMode::RaceOver,
-        RaceMode::RaceOver  => RaceMode::Display,
+        RaceMode::RaceOver  => RaceMode::Standby,
     };
     enter_mode(next);
 }
@@ -427,6 +430,8 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
         .chart-box h3 { color: #ccc; margin: 0 0 8px 0; }
         .chart-box canvas { display: block; max-width: 100%; }
         button { color: white; border: none; padding: 15px 30px; font-size: 18px; border-radius: 5px; cursor: pointer; width: 100%; margin: 10px 0; }
+        .btn-standby { background: #546E7A; }
+        .btn-standby:hover { background: #37474F; }
         .btn-display { background: #2196F3; }
         .btn-display:hover { background: #1976D2; }
         .btn-ready { background: #4CAF50; }
@@ -456,6 +461,7 @@ const HTML_PAGE: &str = r#"<!DOCTYPE html>
             <h3>X Acceleration</h3>
             <canvas id="accel-chart" width="520" height="110"></canvas>
         </div>
+        <button class="btn-standby" onclick="setMode('mode_standby')">Standby</button>
         <button class="btn-display" onclick="setMode('mode_display')">Display Mode</button>
         <button class="btn-ready" onclick="setMode('mode_ready')">Race Ready</button>
         <button class="btn-racing" onclick="setMode('mode_racing')">Racing</button>
@@ -995,6 +1001,9 @@ async fn web_server(stack: Stack<'static>) {
                                                 } else {
                                                     decoded[..payload_len].copy_from_slice(&rx_buf[payload_start..payload_start + payload_len]);
                                                 }
+                                                if &decoded[..payload_len] == b"mode_standby" {
+                                                    enter_mode(RaceMode::Standby);
+                                                }
                                                 if &decoded[..payload_len] == b"mode_display" {
                                                     enter_mode(RaceMode::Display);
                                                 }
@@ -1263,7 +1272,7 @@ async fn main(spawner: Spawner) -> ! {
 
         display_buffer.clear();
         match current_mode() {
-            RaceMode::Display => {
+            RaceMode::Standby | RaceMode::Display => {
                 draw_number_four(&mut display_buffer);
                 draw_display_decorations(&mut display_buffer);
             }

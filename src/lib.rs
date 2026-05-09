@@ -25,6 +25,7 @@ use core::fmt;
 #[derive(Clone, Copy, PartialEq)]
 pub enum Effect {
     Off,
+    Standby,
     BlueRedChase,
     RainbowTravel,
     RainbowSections,
@@ -44,8 +45,8 @@ impl fmt::Display for Effect {
 }
 
 impl Effect {
-    pub const fn all() -> [Effect; 11] {
-        [Effect::Off, Effect::BlueRedChase, Effect::RainbowTravel, Effect::RainbowSections, Effect::WaveChase, Effect::AlternatingGlow, Effect::PulsingGreen, Effect::SolidGreen, Effect::RacingChase, Effect::Fireworks, Effect::CheckerPulse]
+    pub const fn all() -> [Effect; 12] {
+        [Effect::Off, Effect::Standby, Effect::BlueRedChase, Effect::RainbowTravel, Effect::RainbowSections, Effect::WaveChase, Effect::AlternatingGlow, Effect::PulsingGreen, Effect::SolidGreen, Effect::RacingChase, Effect::Fireworks, Effect::CheckerPulse]
     }
 
     pub fn index(self) -> usize {
@@ -55,6 +56,7 @@ impl Effect {
     pub fn as_str(&self) -> &'static str {
         match self {
             Effect::Off => "Off",
+            Effect::Standby => "Standby",
             Effect::BlueRedChase => "Blue Red Chase",
             Effect::RainbowTravel => "Rainbow Travel",
             Effect::RainbowSections => "Rainbow Sections",
@@ -79,6 +81,13 @@ pub fn update_leds(data: &mut [RGB8; TOTAL_LEDS], effect: Effect, time: usize) {
         };
         data[j] = match effect {
             Effect::Off => RGB8::default(),
+            Effect::Standby => match local {
+                // Corner markers: LEDs 1,2,31,32 (0-indexed: 0,1,30,31) — amber half-brightness
+                0 | 1 => RGB8 { r: 128, g: 80, b: 0 },
+                // Centre markers: LEDs 13,14,19,20 (0-indexed: 12,13,18,19) — white half-brightness
+                28 | 29 => RGB8 { r: 128, g: 128, b: 128 },
+                _ => RGB8::default(),
+            },
             Effect::BlueRedChase => {
                 // Chasing blue and red LEDs
                 let position = (time / 3) % (NUM_LEDS * 2);
