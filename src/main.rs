@@ -676,10 +676,12 @@ impl Bmi160 {
 }
 
 fn encode_ws2812(data: &[RGB8], pulses: &mut [PulseCode]) {
-    const T0H: u16 = 28;
-    const T0L: u16 = 55;
-    const T1H: u16 = 56;
-    const T1L: u16 = 28;
+    // RMT clock: 80 MHz → 12.5 ns per tick. WS2812B nominal timings:
+    //   T0H 400 ns, T0L 850 ns, T1H 800 ns, T1L 450 ns — equal 1250 ns bit period.
+    const T0H: u16 = 32;  // 400 ns
+    const T0L: u16 = 68;  // 850 ns
+    const T1H: u16 = 64;  // 800 ns
+    const T1L: u16 = 36;  // 450 ns
 
     fn encode_byte(value: u8, output: &mut [PulseCode], offset: &mut usize) {
         for bit in (0..8).rev() {
@@ -1206,7 +1208,7 @@ async fn main(spawner: Spawner) -> ! {
     let tx_config = TxChannelConfig::default()
         .with_clk_divider(1)
         .with_idle_output_level(Level::Low)
-        .with_idle_output(false)
+        .with_idle_output(true)   // actively drive low between frames for a clean WS2812B reset
         .with_carrier_modulation(false);
 
     let mut channel = rmt
