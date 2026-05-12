@@ -3,7 +3,6 @@
 //! Uses a 0.42-inch SSD1306 I2C OLED display wired to GPIO5 (SDA) and GPIO6 (SCL).
 //! A BMI160 accelerometer/gyroscope is on the same I2C bus, GPIO5 (SDA) and GPIO6 (SCL).
 //! A string of 64 WS2812B LEDs (TOTAL_LEDS) is driven from GPIO7.
-//! Connects to WiFi network "psimonkey" with password "ilikemonkeys" and serves a web page.
 
 #![no_std]
 #![no_main]
